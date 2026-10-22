@@ -2071,9 +2071,15 @@ class IndeedClient:
                     "permitted to collect from.  This project ships no "
                     "built-in Indeed url.")
             if self.config.browser_live_ready:
-                return True, ("visible browser pointed at operator-supplied "
-                              "authorised pages: %s"
-                              % self.config.browser_live_search_url)
+                target = (self.config.browser_live_search_url
+                          or self.config.site_base_url)
+                login = "with a saved login" if (
+                    self.config.use_saved_login
+                    and self.config.auth_file
+                    and os.path.exists(self.config.auth_file)
+                ) else "signed out"
+                return True, ("LIVE collection from %s, %s. Blocks are "
+                              "respected, not worked around." % (target, login))
             return True, (
                 "VISIBLE BROWSER DEMONSTRATION -- Chromium will navigate "
                 "LOCAL FIXTURE PAGES generated on this machine.  Live Indeed "
