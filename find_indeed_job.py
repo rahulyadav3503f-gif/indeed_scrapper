@@ -1,0 +1,1920 @@
+"""Indeed job collector -- main script AND the project's only configuration file.
+
+HOW THIS PROJECT IS ORGANISED
+-----------------------------
+    find_indeed_job.py          <- you are here: all settings + the crawl loop
+    source_file/indeed_client.py      talks to the authorised data source
+    source_file/indeed_extractor.py   builds the 32-column database row
+    source_file/indeed_apply_url.py   resolves the real application url
+    new_mylib.py                      cities and city -> state resolution
+    target_audience_roles.py          the 85 search keywords + non-IT filter
+
+There is deliberately NO ``indeed_config.py``.  Every editable setting is in
+the block below, so one file is the only thing an operator has to open, and
+there is no second place for a setting to disagree with itself.  The modules
+in ``source_file/`` receive what they need through parameters or through the
+``IndeedClientConfig`` object this file builds.
+
+WHAT ONE RUN DOES
+-----------------
+    for each of the 85 keywords (shuffled once per cycle)
+        for each city assigned to this rank (23 of 110 at rank 1 of 5)
+            for each listing page, up to MAX_LISTING_PAGES
+                for each job on the page
+                    fetch detail -> extract 32 columns -> resolve apply url
+                    -> validate -> de-duplicate -> append to current_data.xlsx
+
+Every 100 accepted rows, ``current_data.xlsx`` is archived as
+``current_data_cycleN.xlsx`` and emptied -- the same Excel rollover the
+Naukri scraper already uses, with the same ``cycle_state.json`` counter.  All
+Excel files are written directly into this directory; there is no output
+folder.
+
+LIVE COLLECTION
+---------------
+``LIVE_COLLECTION_ENABLED`` is ``False`` and must stay ``False`` until an
+authorised Indeed data source is configured.  See the long note at the top of
+``source_file/indeed_client.py``: Indeed's public job-search API was retired
+in 2024 and the surviving partner APIs do not return search results, so this
+project collects from offline fixtures and is honest about it.
+"""
+
+import json
+import os
+import random
+import re
+import signal
+import socket
+import sys
+import time
+from datetime import datetime, timedelta
+
+import pandas as pd
+
+# ===========================================================================
+# INDEED JOB SCRAPER CONFIGURATION
+# ===========================================================================
+# Everything below this banner is meant to be edited.  Nothing below the
+# "END OF CONFIGURATION" banner needs to be touched to change behaviour.
+# ---------------------------------------------------------------------------
+
+# -- Rank configuration -----------------------------------------------------
+# The 110 crawl cities are split between num_sys systems; this system takes
+# the slice for `rank`.  rank is 1-based.  Five systems => 23/23/23/23/18.
+rank = 1
+num_sys = 5
+
+# -- Access settings --------------------------------------------------------
+# Live collection must remain disabled until an authorised Indeed data source
+# is configured.  With it off, the client runs on offline fixtures and no
+# request reaches any Indeed host.
+LIVE_COLLECTION_ENABLED = False
+
+# Where an authorised source lives, read from the environment so that no
+# endpoint and no credential is ever written into source control.
+#   INDEED_SOURCE_BASE_URL  e.g. https://api.authorised-partner.example/v2
+#   INDEED_SEARCH_PATH      e.g. jobs/search?q={keyword}&l={city}&page={page}
+#   INDEED_DETAIL_PATH      e.g. jobs/{job_key}
+#   INDEED_API_KEY          the credential (sent as a Bearer token)
+SOURCE_BASE_URL_ENV = "INDEED_SOURCE_BASE_URL"
+SOURCE_SEARCH_PATH_ENV = "INDEED_SEARCH_PATH"
+SOURCE_DETAIL_PATH_ENV = "INDEED_DETAIL_PATH"
+SOURCE_API_KEY_ENV = "INDEED_API_KEY"
+
+# Offline fixtures.  A directory of *.json files replayed instead of the
+# network; when a file does not match, the client generates deterministic
+# fixture jobs so the whole pipeline still runs.
+FIXTURE_DIR = "tests/fixtures"
+FIXTURE_JOBS_PER_PAGE = 12
+FIXTURE_SEED = 20261021
+
+# -- Night pause ------------------------------------------------------------
+# 12:00 AM to 6:00 AM IST: the script sleeps instead of collecting.
+NIGHT_PAUSE_ENABLED = True
+NIGHT_START_HOUR = 0
+NIGHT_END_HOUR = 6
+
+# -- Keyword configuration --------------------------------------------------
+# The 85 keywords are shuffled ONCE per crawl cycle, within their department,
+# seeded from (rank, cycle number) so the order is reproducible and the five
+# ranks do not march in lockstep.
+KEYWORD_SHUFFLE_ENABLED = True
+
+# -- Excel configuration ----------------------------------------------------
+# Both files are written directly into this directory.  No output folder.
+DETAIL_OUTPUT_FILE = "current_data.xlsx"
+MASTER_OUTPUT_FILE = "indeed_it_jobs_by_city.xlsx"
+EXCEL_BATCH_SIZE = 100          # rows per archived current_data_cycleN.xlsx
+
+# -- Cycle configuration ----------------------------------------------------
+CYCLE_COOLDOWN_MINUTES = 45     # rest between finished crawl cycles
+
+# -- Listing configuration --------------------------------------------------
+MAX_LISTING_PAGES = 10          # per (keyword, city) pair
+RESULTS_PER_PAGE = 20           # what one listing page holds
+
+# -- Periodic breaks --------------------------------------------------------
+# After WORK_PERIOD hours of ACTUAL WORKING time (night stops, breaks,
+# cooldowns and waits do not count), stop for a random break.
+WORK_BREAK_MIN_MINUTES = 30
+WORK_BREAK_MAX_MINUTES = 60
+WORK_PERIOD_MIN_HOURS = 3.7
+WORK_PERIOD_MAX_HOURS = 4.2
+
+# -- Request pacing ---------------------------------------------------------
+REQUEST_GAP_SECONDS = 2.0       # polite gap between source requests
+JOB_GAP_SECONDS = 1.0           # between two job detail reads
+CITY_GAP_SECONDS = 5            # between two cities
+KEYWORD_GAP_SECONDS = 15        # between two keywords
+PACING_JITTER_FRACTION = 0.35   # spreads the ranks apart; not evasion
+
+# -- HTTP timeout settings --------------------------------------------------
+HTTP_CONNECT_TIMEOUT_SECONDS = 10
+HTTP_READ_TIMEOUT_SECONDS = 30
+HTTP_USER_AGENT = "JobEasyIndia-IndeedCollector/1.0"
+
+# -- Retry configuration ----------------------------------------------------
+MAX_RETRIES_5XX = 4
+BACKOFF_5XX_SECONDS = (5, 15, 45, 120)
+MAX_RETRIES_NETWORK = 3
+BACKOFF_NETWORK_SECONDS = (5, 15, 45)
+MAX_RETRIES_429 = 3
+BACKOFF_429_SECONDS = (60, 180)             # only when Retry-After is absent
+DEFAULT_429_WAIT_SECONDS = 120
+RETRY_AFTER_CAP_SECONDS = 3600
+ACCESS_BREAK_SECONDS = 600                  # the 403 cooldown
+MAX_BLOCK_COOLDOWNS = 3                     # then stop, checkpoint intact
+UNEXPECTED_ERROR_COOLDOWN_SECONDS = 300
+
+# -- Failed-work queue ------------------------------------------------------
+# Retryable failures only.  A denied endpoint is never retried in a loop.
+FAILED_PAGES_MAX = 5000
+FAILED_RETRY_DELAY_SECONDS = 1800
+QUEUE_BATCH_SIZE = 3                        # queued items per visit
+QUEUE_CHECK_EVERY_COMBOS = 5
+QUEUE_DEFER_SECONDS = (1800, 3600, 10800, 21600)      # 30m 1h 3h 6h
+QUEUE_MAX_DEFERRALS = len(QUEUE_DEFER_SECONDS)
+
+# -- State files ------------------------------------------------------------
+# All JSON checkpoints live directly in this directory, like the Naukri
+# project's.  ``current_row.json`` from the brief's example list is NOT
+# created: the crawl position is (keyword index, city index, page, done job
+# urls) inside crawl_cycle_state.json, which is written atomically as one
+# unit.  A second file holding the same row pointer could disagree with it
+# after a crash, and the reference implementation does not keep one either.
+CYCLE_STATE_FILE = "cycle_state.json"               # EXCEL archive counter
+CRAWL_CYCLE_STATE_FILE = "crawl_cycle_state.json"   # keyword-cycle position
+CITY_STATE_FILE = "state_city.json"                 # readable progress log
+ROLE_STATE_FILE = "state_role.json"                 # readable progress log
+FAILED_PAGES_FILE = "failed_pages.json"             # retryable failures
+
+# -- Internet check ---------------------------------------------------------
+INTERNET_CHECK_ENABLED = True
+INTERNET_CHECK_HOST = "8.8.8.8"
+INTERNET_CHECK_PORT = 53
+INTERNET_CHECK_TIMEOUT = 3
+INTERNET_RECHECK_SECONDS = 5
+
+# -- Timezone ---------------------------------------------------------------
+# The night window and the break schedule are read in this timezone.
+TIMEZONE = "Asia/Kolkata"
+
+# -- Scoring / defaults written into every row ------------------------------
+DEFAULT_JOB_SCORE = 30
+DEFAULT_COUNTRY = "India"
+
+# -- Browser settings -------------------------------------------------------
+# This collector talks to a JSON data source over HTTP; it drives no browser,
+# so there is no headless flag, no user-data directory and no login file to
+# configure.  The settings a browser would need are listed here so that the
+# answer is in the configuration block rather than missing from it.
+BROWSER_REQUIRED = False
+BROWSER_HEADLESS = True                     # unused while BROWSER_REQUIRED is False
+
+# -- Logging ----------------------------------------------------------------
+VERBOSE = True
+LOG_EVERY_ROW = True
+
+# ===========================================================================
+# END OF CONFIGURATION
+# ===========================================================================
+
+from source_file.indeed_apply_url import extract_apply_url            # noqa: E402
+from source_file.indeed_client import (                                # noqa: E402
+    IndeedAccessDenied,
+    IndeedClient,
+    IndeedClientConfig,
+    IndeedClientError,
+    IndeedDataError,
+    IndeedNetworkError,
+    IndeedRateLimited,
+    IndeedServerError,
+)
+from source_file.indeed_extractor import (                             # noqa: E402
+    DETAIL_COLUMNS,
+    SOURCE_PLATFORM,
+    clean_value,
+    extract_job_details,
+    row_for_excel,
+    validate_row,
+)
+
+from new_mylib import city_by_states, city_to_state, job_by_department  # noqa: E402
+
+try:
+    from target_audience_roles import is_non_it_title, role_plan_split
+except ImportError:                                 # pragma: no cover
+    is_non_it_title = None
+    role_plan_split = None
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Every runtime file is resolved against the project root, so the service and
+# an interactive run write to the same place no matter the working directory.
+
+
+def project_path(name: str) -> str:
+    """A runtime file's absolute path inside the project root."""
+    if os.path.isabs(name):
+        return name
+    return os.path.join(BASE_DIR, name)
+
+
+MASTER_COLUMNS = [
+    "state", "role_category", "job_title", "location",
+    "search_keyword", "sample_job_url",
+    "first_seen_at", "last_seen_at",
+    "seen_count", "is_active",
+    "source_platform", "source_type",
+]
+
+CRAWL_CYCLE_SCHEMA_VERSION = 1
+ROLE_CATEGORY = "IT Department"
+
+_SHUTDOWN_REQUESTED = False
+_CHECKPOINT_SAVER = None
+
+
+# ===========================================================================
+# SMALL HELPERS
+# ===========================================================================
+
+def log(message=""):
+    if VERBOSE:
+        print(message, flush=True)
+
+
+def now_time() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def local_now():
+    """Now in TIMEZONE, falling back to system local time."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(TIMEZONE))
+    except Exception:                               # pragma: no cover
+        return datetime.now()
+
+
+def human_duration(seconds) -> str:
+    seconds = int(max(0, seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return "%dh %02dm" % (hours, minutes)
+    if minutes:
+        return "%dm %02ds" % (minutes, secs)
+    return "%ds" % secs
+
+
+def make_slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(text or "").lower()).strip("-")
+
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+
+def make_unique_key(role_category: str, job_title: str, location: str) -> str:
+    """The master workbook's identity for a job.  Same shape as Naukri's."""
+    return "|".join([
+        normalize_text(role_category),
+        normalize_text(job_title),
+        normalize_text(location),
+    ])
+
+
+def write_json_atomic(path: str, payload) -> None:
+    """Write JSON through a temp file, so a kill never leaves half a file."""
+    path = project_path(path)
+    folder = os.path.dirname(path) or "."
+    temp = os.path.join(folder, ".%s.tmp" % os.path.basename(path))
+    with open(temp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=4, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+
+
+def read_json_or_none(path: str):
+    path = project_path(path)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception as error:
+        log("  [WARN] %s unreadable (%s) -- treating as absent."
+            % (os.path.basename(path), error))
+        return None
+
+
+# ===========================================================================
+# INTERNET
+# ===========================================================================
+
+def is_internet_available() -> bool:
+    if not INTERNET_CHECK_ENABLED:
+        return True
+    try:
+        socket.setdefaulttimeout(INTERNET_CHECK_TIMEOUT)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.connect((INTERNET_CHECK_HOST, INTERNET_CHECK_PORT))
+        return True
+    except OSError:
+        return False
+
+
+def wait_for_internet(check_interval=None) -> None:
+    """Block until the connection is back.  Waiting is not working time."""
+    if not INTERNET_CHECK_ENABLED or is_internet_available():
+        return
+    interval = check_interval or INTERNET_RECHECK_SECONDS
+    work_clock_pause()
+    try:
+        log("  [NET] No internet. Waiting; the checkpoint is already saved.")
+        while not is_internet_available():
+            time.sleep(interval)
+        log("  [NET] Internet is back -- resuming.")
+    finally:
+        work_clock_resume()
+
+
+# ===========================================================================
+# EXCEL: SAFE READ, SAFE WRITE, ROLLOVER
+# ===========================================================================
+# This is the Naukri method, unchanged in behaviour:
+#
+#   * current_data.xlsx is the working file;
+#   * at EXCEL_BATCH_SIZE rows it is archived as current_data_cycleN.xlsx,
+#     where N comes from cycle_state.json and is then incremented;
+#   * current_data.xlsx is re-created empty with the same 32 columns;
+#   * nothing is ever written into a subdirectory.
+#
+# The archive counter in cycle_state.json has NOTHING to do with the keyword
+# crawl cycle in crawl_cycle_state.json.  Two different things, two files,
+# two different words.
+
+_ILLEGAL_EXCEL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _needs_cleaning(value) -> bool:
+    return isinstance(value, str) and bool(_ILLEGAL_EXCEL_CHARS.search(value))
+
+
+def _clean_cell(value):
+    if isinstance(value, str):
+        return _ILLEGAL_EXCEL_CHARS.sub("", value)
+    return value
+
+
+def safe_read_excel_or_empty(file_path: str, columns: list) -> pd.DataFrame:
+    """Read Excel safely.
+
+    A missing, empty, half-written or corrupted workbook is removed and
+    replaced by an empty frame rather than ending the run.
+    """
+    from zipfile import BadZipFile
+
+    file_path = project_path(file_path)
+    if not os.path.exists(file_path):
+        return pd.DataFrame(columns=columns)
+
+    try:
+        if os.path.getsize(file_path) == 0:
+            raise ValueError("Excel file is empty.")
+        return pd.read_excel(file_path, engine="openpyxl")
+    except (BadZipFile, ValueError, OSError, EOFError, KeyError) as error:
+        log("⚠️ Corrupted Excel found: %s. Removing it and continuing. "
+            "Error: %s" % (file_path, error))
+        try:
+            os.remove(file_path)
+        except OSError as remove_error:
+            log("⚠️ Could not remove corrupted file %s: %s"
+                % (file_path, remove_error))
+        return pd.DataFrame(columns=columns)
+
+
+def safe_to_excel(df: pd.DataFrame, file_path: str) -> None:
+    """Sanitise, then write through a temp file and rename into place.
+
+    Ctrl+C in the middle of a save can therefore never corrupt the real
+    workbook: the rename is atomic.
+    """
+    file_path = project_path(file_path)
+
+    cleaned = None
+    cleaned_cells = 0
+    for column in list(df.columns):
+        original = df[column]
+        changed = int(original.map(_needs_cleaning).sum())
+        if changed:
+            if cleaned is None:
+                cleaned = df.copy()
+            cleaned[column] = original.map(_clean_cell)
+            cleaned_cells += changed
+    if cleaned_cells:
+        log("      🧹 Removed Excel-illegal control characters from %d cell(s) "
+            "before saving %s." % (cleaned_cells, os.path.basename(file_path)))
+    frame = cleaned if cleaned is not None else df
+
+    folder = os.path.dirname(os.path.abspath(file_path))
+    name, ext = os.path.splitext(os.path.basename(file_path))
+    temp_file = os.path.join(folder, ".%s.tmp%s" % (name, ext))
+    if os.path.exists(temp_file):
+        try:
+            os.remove(temp_file)
+        except OSError:
+            pass
+
+    frame.to_excel(temp_file, index=False, engine="openpyxl")
+    os.replace(temp_file, file_path)
+
+
+def load_cycle_num() -> int:
+    """The Excel ARCHIVE counter from cycle_state.json (0 when absent)."""
+    data = read_json_or_none(CYCLE_STATE_FILE)
+    if not isinstance(data, dict):
+        return 0
+    try:
+        return int(data.get("cycle_num", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def save_cycle_num(cycle_num: int) -> None:
+    write_json_atomic(CYCLE_STATE_FILE, {"cycle_num": int(cycle_num)})
+
+
+def get_next_cycle_file(base_file=None):
+    """``(filename, number)`` for the next archive.
+
+    cycle_num = 0 -> current_data_cycle1.xlsx
+    cycle_num = 1 -> current_data_cycle2.xlsx
+
+    Reading the number from disk every time is what makes the sequence
+    survive a restart: nothing is ever hardcoded and no archive is
+    overwritten.
+    """
+    base_file = base_file or DETAIL_OUTPUT_FILE
+    base_name = os.path.splitext(os.path.basename(base_file))[0]
+    next_cycle = load_cycle_num() + 1
+
+    # Belt and braces: if an archive with that number somehow exists already
+    # (a state file deleted by hand, say), step past it rather than
+    # destroying collected data.
+    while os.path.exists(project_path("%s_cycle%d.xlsx"
+                                      % (base_name, next_cycle))):
+        next_cycle += 1
+
+    return "%s_cycle%d.xlsx" % (base_name, next_cycle), next_cycle
+
+
+_SAVED_KEYS = None          # (source_url, job_id) already in the working file
+
+
+def _saved_keys(df: pd.DataFrame) -> set:
+    keys = set()
+    for column in ("source_url", "job_id"):
+        if column in df.columns:
+            for value in df[column].tolist():
+                text = str(value or "").strip()
+                if text:
+                    keys.add(text)
+    return keys
+
+
+def is_duplicate_row(row: dict, df: pd.DataFrame) -> bool:
+    """True when this job is already in the working workbook."""
+    if df is None or df.empty:
+        return False
+    for column in ("source_url", "job_id"):
+        value = str(row.get(column) or "").strip()
+        if not value or column not in df.columns:
+            continue
+        if (df[column].astype(str).str.strip() == value).any():
+            return True
+    return False
+
+
+def append_detail_to_excel(row, output_file=None, cycle_size=None):
+    """Append one accepted job to current_data.xlsx, archiving at the batch size.
+
+    Guards applied in order, each of which skips THIS job only and never
+    stops the run:
+      1. the row must be a dict with the required fields (validate_row);
+      2. non-IT titles are rejected (target_audience_roles.is_non_it_title);
+      3. a job already in the working file is not written twice;
+      4. a row Excel still refuses after sanitising is skipped and logged.
+    """
+    global _SAVED_KEYS
+
+    output_file = output_file or DETAIL_OUTPUT_FILE
+    cycle_size = int(cycle_size or EXCEL_BATCH_SIZE)
+
+    if not isinstance(row, dict):
+        return None
+
+    is_valid, reason = validate_row(row)
+    if not is_valid:
+        log("      ⚠️  Skipped incomplete job (%s): %s"
+            % (reason, str(row.get("job_title", ""))[:60]))
+        return None
+
+    title = str(row.get("job_title", ""))
+    if is_non_it_title is not None and title and is_non_it_title(title):
+        log("      🚫 Skipped non-IT job: %s" % title[:70])
+        return None
+
+    df = safe_read_excel_or_empty(output_file, DETAIL_COLUMNS)
+    if df.empty and list(df.columns) != DETAIL_COLUMNS:
+        df = pd.DataFrame(columns=DETAIL_COLUMNS)
+
+    if is_duplicate_row(row, df):
+        log("      ⏭️  Duplicate, already saved: %s" % title[:60])
+        return None
+
+    clean_row = row_for_excel(row)
+    df = pd.concat([df, pd.DataFrame([clean_row])], ignore_index=True)
+
+    try:
+        if len(df) >= cycle_size:
+            cycle_file, cycle_num = get_next_cycle_file(output_file)
+            safe_to_excel(df, cycle_file)
+            save_cycle_num(cycle_num)
+            safe_to_excel(pd.DataFrame(columns=DETAIL_COLUMNS), output_file)
+            log("      📦 Excel batch complete → %s | rows: %d"
+                % (cycle_file, len(df)))
+            log("      ♻️  Emptied → %s" % output_file)
+            _SAVED_KEYS = set()
+        else:
+            safe_to_excel(df, output_file)
+            if LOG_EVERY_ROW:
+                log("      💾 Saved detail → %s | rows: %d/%d"
+                    % (output_file, len(df), cycle_size))
+            if _SAVED_KEYS is not None:
+                _SAVED_KEYS.update(_saved_keys(pd.DataFrame([clean_row])))
+    except Exception as error:
+        # openpyxl's IllegalCharacterError and friends: one bad job must not
+        # end a run that has been collecting for hours.
+        if type(error).__name__ not in ("IllegalCharacterError", "ValueError",
+                                        "TypeError"):
+            raise
+        log("      ⚠️  Excel refused this job (%s: %s) -- skipping it: %s"
+            % (type(error).__name__, error, title[:60]))
+        return None
+
+    return clean_row
+
+
+# -- master workbook --------------------------------------------------------
+
+def load_existing_master() -> pd.DataFrame:
+    df = safe_read_excel_or_empty(MASTER_OUTPUT_FILE, MASTER_COLUMNS)
+    for column in MASTER_COLUMNS:
+        if column not in df.columns:
+            df[column] = ""
+    return df[MASTER_COLUMNS] if not df.empty else pd.DataFrame(
+        columns=MASTER_COLUMNS)
+
+
+def save_master(df: pd.DataFrame) -> None:
+    if df is None or len(df) == 0:
+        return
+    for column in MASTER_COLUMNS:
+        if column not in df.columns:
+            df[column] = ""
+    safe_to_excel(df[MASTER_COLUMNS], MASTER_OUTPUT_FILE)
+
+
+# ===========================================================================
+# READABLE PROGRESS STATE (state_city.json / state_role.json)
+# ===========================================================================
+# Kept because the reference project keeps them and operators read them.
+# They are a LOG, not the resume authority -- crawl_cycle_state.json is.
+
+def load_city_state() -> dict:
+    data = read_json_or_none(CITY_STATE_FILE) or {}
+    try:
+        page = int(data.get("page_number", 1))
+    except (TypeError, ValueError):
+        page = 1
+    return {"city_name": data.get("city_name"), "page_number": page}
+
+
+def save_city_state(city_name, page_number) -> None:
+    write_json_atomic(CITY_STATE_FILE, {
+        "city_name": city_name,
+        "page_number": int(page_number),
+    })
+
+
+def reset_city_state() -> None:
+    save_city_state(None, 1)
+
+
+def load_role_state() -> dict:
+    data = read_json_or_none(ROLE_STATE_FILE) or {}
+    return {
+        "role_category": data.get("role_category"),
+        "search_keyword": data.get("search_keyword"),
+    }
+
+
+def save_role_state(role_category, search_keyword) -> None:
+    write_json_atomic(ROLE_STATE_FILE, {
+        "role_category": role_category,
+        "search_keyword": search_keyword,
+    })
+
+
+def reset_role_state() -> None:
+    save_role_state(None, None)
+
+
+# ===========================================================================
+# FAILED-WORK QUEUE (retryable failures only)
+# ===========================================================================
+
+def load_failed_pages() -> list:
+    loaded = read_json_or_none(FAILED_PAGES_FILE)
+    return loaded if isinstance(loaded, list) else []
+
+
+def record_failed(kind, reference, reason, status=None, attempts=1,
+                  context=None, recovery_status="pending",
+                  retry_delay_seconds=None) -> None:
+    """Record one unit of lost work, de-duplicated on (reference, status).
+
+    A 403 is recorded with ``recovery_status="manual"`` by the caller, so the
+    queue is never used to hammer an endpoint that has refused access.
+    """
+    context = dict(context or {})
+    now = datetime.now()
+    delay = (FAILED_RETRY_DELAY_SECONDS if retry_delay_seconds is None
+             else int(retry_delay_seconds))
+
+    entry = {
+        "reference": str(reference),
+        "work_type": "detail" if kind == "detail" else "listing",
+        "http_status": int(status) if status is not None else None,
+        "keyword": context.get("keyword"),
+        "city": context.get("city"),
+        "page_number": context.get("page_number"),
+        "attempts": int(attempts),
+        "failed_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "next_retry_at": (now + timedelta(seconds=delay)).strftime(
+            "%Y-%m-%d %H:%M:%S"),
+        "reason": str(reason)[:500],
+        "recovery_status": recovery_status,
+        "deferrals": 0,
+        "rank": rank,
+        "kind": kind,
+    }
+
+    queue = load_failed_pages()
+    for existing in queue:
+        if (existing.get("reference") == entry["reference"]
+                and existing.get("http_status") == entry["http_status"]):
+            entry["attempts"] = int(existing.get("attempts", 0)) + int(attempts)
+            entry["deferrals"] = int(existing.get("deferrals", 0))
+            entry["first_failed_at"] = existing.get(
+                "first_failed_at", existing.get("failed_at"))
+            existing.clear()
+            existing.update(entry)
+            write_json_atomic(FAILED_PAGES_FILE, queue)
+            log("      📌 queue updated (%s, %d attempt(s)): %s"
+                % (reason, entry["attempts"], reference))
+            return
+
+    entry["first_failed_at"] = entry["failed_at"]
+    queue.append(entry)
+    if len(queue) > FAILED_PAGES_MAX:
+        queue = queue[-FAILED_PAGES_MAX:]
+    write_json_atomic(FAILED_PAGES_FILE, queue)
+    log("      📌 queued for a later retry (%s): %s" % (reason, reference))
+
+
+def mark_failed_resolved(reference) -> None:
+    queue = load_failed_pages()
+    touched = False
+    for entry in queue:
+        if (entry.get("reference") == str(reference)
+                and entry.get("recovery_status") != "resolved"):
+            entry["recovery_status"] = "resolved"
+            entry["resolved_at"] = now_time()
+            touched = True
+    if touched:
+        write_json_atomic(FAILED_PAGES_FILE, queue)
+        log("      ✔ previously failed work recovered: %s" % reference)
+
+
+def queue_eligible(limit=None) -> list:
+    """Entries whose retry time has passed and that are still retryable."""
+    now = datetime.now()
+    eligible = []
+    for entry in load_failed_pages():
+        if entry.get("recovery_status") in ("resolved", "manual"):
+            continue
+        when = entry.get("next_retry_at")
+        try:
+            due = datetime.strptime(str(when), "%Y-%m-%d %H:%M:%S") <= now
+        except (TypeError, ValueError):
+            due = True
+        if due:
+            eligible.append(entry)
+        if limit and len(eligible) >= int(limit):
+            break
+    return eligible
+
+
+def defer_queue_entry(entry, reason="") -> None:
+    """Push an entry further out; after the last step it needs a human.
+
+    Escalation, not repetition -- this is what stops an endless retry loop.
+    """
+    reference = entry.get("reference")
+    queue = load_failed_pages()
+    for stored in queue:
+        if stored.get("reference") != reference:
+            continue
+        deferrals = int(stored.get("deferrals", 0)) + 1
+        step = QUEUE_DEFER_SECONDS[min(deferrals - 1,
+                                       len(QUEUE_DEFER_SECONDS) - 1)]
+        stored["deferrals"] = deferrals
+        stored["next_retry_at"] = (
+            datetime.now() + timedelta(seconds=step)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        stored["last_reason"] = str(reason)[:300]
+        if deferrals >= QUEUE_MAX_DEFERRALS:
+            stored["recovery_status"] = "manual"
+            log("      🛑 %s has failed %d times -- marked 'manual', it will "
+                "not be retried automatically again." % (reference, deferrals))
+        else:
+            log("      ⏳ %s deferred for %s (deferral %d/%d)"
+                % (reference, human_duration(step), deferrals,
+                   QUEUE_MAX_DEFERRALS))
+        break
+    write_json_atomic(FAILED_PAGES_FILE, queue)
+
+
+def failed_queue_summary():
+    """``(pending, due_now, manual, resolved)`` for end-of-cycle reporting."""
+    pending = due = manual = resolved = 0
+    now = datetime.now()
+    for entry in load_failed_pages():
+        status = entry.get("recovery_status")
+        if status == "resolved":
+            resolved += 1
+            continue
+        if status == "manual":
+            manual += 1
+            continue
+        pending += 1
+        try:
+            if datetime.strptime(str(entry.get("next_retry_at")),
+                                 "%Y-%m-%d %H:%M:%S") <= now:
+                due += 1
+        except (TypeError, ValueError):
+            due += 1
+    return pending, due, manual, resolved
+
+
+# ===========================================================================
+# WORK CLOCK, NIGHT WINDOW, BREAKS
+# ===========================================================================
+# The clock measures WORKING time.  Night stops, work breaks, cycle
+# cooldowns, access cooldowns and waiting for the internet are all excluded,
+# so "4 hours of work" means four hours of actual collecting.
+
+
+class ScheduledPause(Exception):
+    """A scheduled stop is due.  Unwinds to the orchestrator."""
+
+    def __init__(self, reason, seconds, reset_work_timer=True):
+        super().__init__(reason)
+        self.reason = reason
+        self.seconds = max(0, int(seconds))
+        self.reset_work_timer = reset_work_timer
+
+
+class AccessBlocked(Exception):
+    """Access was refused (403) or the quota is spent (429)."""
+
+    def __init__(self, status, reference, wait_seconds=None, detail="",
+                 work_type="listing", scope="isolated", attempts=1,
+                 context=None):
+        super().__init__("HTTP %s on %s" % (status, reference))
+        self.status = status
+        self.reference = reference
+        self.wait_seconds = wait_seconds
+        self.detail = detail
+        self.work_type = work_type
+        self.scope = scope
+        self.attempts = attempts
+        self.context = dict(context or {})
+
+    @property
+    def label(self):
+        return "HTTP %s" % self.status
+
+
+_WORK_SESSION_START = None
+_WORK_ACCUMULATED = 0.0
+_WORK_MARK = None
+_WORK_PAUSE_DEPTH = 0
+_WORK_PERIOD_HOURS = None       # drawn fresh for each work period
+
+
+def pick_work_period_hours() -> float:
+    """A fresh work period from the configured range.
+
+    A range rather than a single number so the five ranks do not all stop at
+    the same minute and queue up on the data source together.
+    """
+    low = float(min(WORK_PERIOD_MIN_HOURS, WORK_PERIOD_MAX_HOURS))
+    high = float(max(WORK_PERIOD_MIN_HOURS, WORK_PERIOD_MAX_HOURS))
+    if high <= low:
+        return max(0.01, low)
+    return max(0.01, random.uniform(low, high))
+
+
+def pick_break_seconds() -> int:
+    low = int(min(WORK_BREAK_MIN_MINUTES, WORK_BREAK_MAX_MINUTES)) * 60
+    high = int(max(WORK_BREAK_MIN_MINUTES, WORK_BREAK_MAX_MINUTES)) * 60
+    if high <= low:
+        return low
+    return random.randint(low, high)
+
+
+def reset_work_timer() -> None:
+    global _WORK_SESSION_START, _WORK_ACCUMULATED, _WORK_MARK
+    global _WORK_PAUSE_DEPTH, _WORK_PERIOD_HOURS
+    _WORK_SESSION_START = time.monotonic()
+    _WORK_ACCUMULATED = 0.0
+    _WORK_MARK = time.monotonic()
+    _WORK_PAUSE_DEPTH = 0
+    _WORK_PERIOD_HOURS = pick_work_period_hours()
+
+
+def work_clock_pause() -> None:
+    global _WORK_ACCUMULATED, _WORK_MARK, _WORK_PAUSE_DEPTH
+    _WORK_PAUSE_DEPTH += 1
+    if _WORK_PAUSE_DEPTH == 1 and _WORK_MARK is not None:
+        _WORK_ACCUMULATED += time.monotonic() - _WORK_MARK
+        _WORK_MARK = None
+
+
+def work_clock_resume() -> None:
+    global _WORK_MARK, _WORK_PAUSE_DEPTH
+    if _WORK_PAUSE_DEPTH > 0:
+        _WORK_PAUSE_DEPTH -= 1
+    if _WORK_PAUSE_DEPTH == 0 and _WORK_MARK is None:
+        _WORK_MARK = time.monotonic()
+
+
+def work_seconds() -> float:
+    if _WORK_SESSION_START is None:
+        return 0.0
+    total = _WORK_ACCUMULATED
+    if _WORK_MARK is not None:
+        total += time.monotonic() - _WORK_MARK
+    return total
+
+
+def night_seconds_remaining(now=None) -> int:
+    """Seconds until the night window ends, or 0 when outside it."""
+    if not NIGHT_PAUSE_ENABLED:
+        return 0
+    now = now or local_now()
+    start = int(NIGHT_START_HOUR) % 24
+    end = int(NIGHT_END_HOUR) % 24
+    if start == end:
+        return 0
+
+    hour = now.hour
+    if start < end:
+        inside = start <= hour < end
+    else:                                       # window crosses midnight
+        inside = hour >= start or hour < end
+    if not inside:
+        return 0
+
+    target = now.replace(hour=end, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target = target + timedelta(days=1)
+    return max(0, int((target - now).total_seconds()))
+
+
+def pacing_gate() -> None:
+    """Raise ScheduledPause when a stop is due.
+
+    Called ONLY at safe boundaries -- before a combo and before a listing
+    page -- so a page is never abandoned half way through its jobs.
+    """
+    if _SHUTDOWN_REQUESTED:
+        raise KeyboardInterrupt("shutdown requested")
+
+    night = night_seconds_remaining()
+    if night > 0:
+        raise ScheduledPause(
+            "night pause %02d:00-%02d:00 %s"
+            % (NIGHT_START_HOUR, NIGHT_END_HOUR, TIMEZONE), night)
+
+    worked = work_seconds()
+    period = _WORK_PERIOD_HOURS or pick_work_period_hours()
+    if _WORK_SESSION_START is not None and worked >= period * 3600.0:
+        break_seconds = pick_break_seconds()
+        raise ScheduledPause(
+            "%.2f-hour work period reached (%.2f h actually worked) -- taking "
+            "a %s break (random %d-%d min)"
+            % (period, worked / 3600.0, human_duration(break_seconds),
+               WORK_BREAK_MIN_MINUTES, WORK_BREAK_MAX_MINUTES),
+            break_seconds)
+
+
+def sleep_jitter(base_seconds, label="") -> None:
+    """A short configured gap, spread slightly so ranks do not synchronise."""
+    if base_seconds <= 0:
+        return
+    delay = float(base_seconds) * (1.0 + random.uniform(
+        0.0, max(0.0, PACING_JITTER_FRACTION)))
+    if label:
+        log("      ... %s %.1fs" % (label, delay))
+    time.sleep(delay)
+
+
+def sleep_long(seconds, reason) -> None:
+    """A long wait, reported every five minutes so a run never looks hung."""
+    seconds = max(0, int(seconds))
+    if seconds <= 0:
+        return
+    resume_at = datetime.now() + timedelta(seconds=seconds)
+    log("\n⏸  PAUSE: %s" % reason)
+    log("   sleeping %s -- back at %s"
+        % (human_duration(seconds), resume_at.strftime("%Y-%m-%d %H:%M:%S")))
+
+    work_clock_pause()
+    try:
+        remaining = seconds
+        while remaining > 0:
+            if _SHUTDOWN_REQUESTED:
+                raise KeyboardInterrupt("shutdown requested during pause")
+            step = min(300, remaining)
+            time.sleep(step)
+            remaining -= step
+            if remaining > 0:
+                log("   still paused -- %s to go" % human_duration(remaining))
+    finally:
+        work_clock_resume()
+    log("▶️  Resuming: %s\n" % reason)
+
+
+# ===========================================================================
+# CITY DISTRIBUTION
+# ===========================================================================
+
+def get_cities_by_rank(all_cities: list, rank: int, num_sys: int) -> list:
+    """The symmetric slice this rank owns.
+
+    The reference implementation, preserved exactly -- it is positional, so
+    every city is assigned to exactly one rank, none is skipped, and the
+    slice sizes differ by at most one:
+
+        one_unit  = int(len(cities) / num_sys) + 1
+        cities[one_unit * (rank - 1) : one_unit * rank]
+
+    With 110 cities and num_sys=5 this gives 23/23/23/23/18.
+    """
+    if not all_cities:
+        return []
+    try:
+        rank = int(rank)
+        num_sys = int(num_sys)
+    except (TypeError, ValueError):
+        return []
+    if num_sys < 1 or rank < 1 or rank > num_sys:
+        return []
+
+    len_city = len(all_cities)
+    one_unit = int(len_city / num_sys) + 1
+    first_idx = one_unit * (rank - 1)
+    last_idx = one_unit * rank
+    return all_cities[first_idx:last_idx]
+
+
+def all_cities() -> list:
+    """The 110 crawl cities, de-duplicated, ORDER PRESERVED (it is positional)."""
+    cities = [city for cities in city_by_states.values() for city in cities]
+    return list(dict.fromkeys(cities))
+
+
+def rank_cities() -> list:
+    cities = get_cities_by_rank(all_cities(), rank, num_sys)
+    if not cities:
+        raise RuntimeError(
+            "get_cities_by_rank() returned no cities for rank=%s num_sys=%s "
+            "out of %d cities. Check rank/num_sys at the top of this file."
+            % (rank, num_sys, len(all_cities())))
+    return cities
+
+
+_CITY_STATE_CACHE = {}
+
+
+def city_state_name(city: str) -> str:
+    """``city_to_state()`` with a cache -- the answer never changes."""
+    if city not in _CITY_STATE_CACHE:
+        try:
+            _CITY_STATE_CACHE[city] = city_to_state(city)
+        except Exception as error:
+            log("  [WARN] city_to_state(%r) failed: %s" % (city, error))
+            _CITY_STATE_CACHE[city] = "Other"
+    return _CITY_STATE_CACHE[city]
+
+
+# ===========================================================================
+# KEYWORD PLAN AND THE PER-CYCLE SHUFFLE
+# ===========================================================================
+
+def keyword_plan_pairs() -> list:
+    """``[(role_category, keyword), ...]`` -- the 85-keyword plan, file order.
+
+    The bare department keyword is dropped: a broad "IT Department" search
+    returns whatever the source chooses to show, which is one of the ways
+    non-IT jobs reach the database.
+    """
+    pairs = []
+    seen = set()
+    for category, titles in job_by_department.items():
+        category_key = str(category).strip().lower()
+        for title in titles:
+            keyword = str(title).strip()
+            if not keyword or keyword.lower() == category_key:
+                continue
+            dedupe_key = (category_key, keyword.lower())
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            pairs.append((str(category), keyword))
+    if not pairs:
+        raise RuntimeError("the role plan produced no searchable keywords.")
+    return pairs
+
+
+def fingerprint(items) -> str:
+    import hashlib
+    payload = " ".join(str(item) for item in items)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def plan_fingerprint(plan_pairs) -> str:
+    return fingerprint(sorted("%s|%s" % pair for pair in plan_pairs))
+
+
+def build_keyword_order(plan_pairs, crawl_cycle_number):
+    """A permutation of the plan, shuffled WITHIN each department.
+
+    The seed is derived from (rank, cycle number, department), so:
+      * the order is reproducible from the cycle number alone -- a lost state
+        file cannot force a reshuffle in the middle of a cycle;
+      * rank is in the seed, so rank 1 and rank 5 crawl different orders.
+
+    A permutation cannot drop or duplicate a keyword, and that is asserted
+    rather than assumed.
+    """
+    import hashlib
+    from collections import OrderedDict
+
+    buckets = OrderedDict()
+    for category, keyword in plan_pairs:
+        buckets.setdefault(category, []).append(keyword)
+
+    order = []
+    seeds = {}
+    for category, keywords in buckets.items():
+        shuffled = list(keywords)
+        if KEYWORD_SHUFFLE_ENABLED:
+            seed_source = "%s|%s|%s" % (rank, crawl_cycle_number, category)
+            seed = int(hashlib.sha1(seed_source.encode("utf-8"))
+                       .hexdigest()[:12], 16)
+            seeds[category] = seed
+            random.Random(seed).shuffle(shuffled)
+        else:
+            seeds[category] = None
+
+        if len(shuffled) != len(keywords) or set(shuffled) != set(keywords):
+            raise RuntimeError(
+                "shuffle corrupted the keyword plan for %r (%d in, %d out)"
+                % (category, len(keywords), len(shuffled)))
+        order.extend([category, keyword] for keyword in shuffled)
+
+    if len(order) != len(plan_pairs):
+        raise RuntimeError("keyword order has %d entries but the plan has %d"
+                           % (len(order), len(plan_pairs)))
+    return order, seeds
+
+
+# ===========================================================================
+# CRAWL CYCLE STATE
+# ===========================================================================
+
+def load_crawl_cycle_state():
+    data = read_json_or_none(CRAWL_CYCLE_STATE_FILE)
+    return data if isinstance(data, dict) else None
+
+
+def save_crawl_cycle_state(state) -> None:
+    state["updated_at"] = now_time()
+    write_json_atomic(CRAWL_CYCLE_STATE_FILE, state)
+
+
+def open_new_crawl_cycle(cities, plan_pairs, previous_number):
+    """Open cycle N+1: shuffle once, persist BEFORE the first request."""
+    number = int(previous_number) + 1
+    order, seeds = build_keyword_order(plan_pairs, number)
+
+    state = {
+        "schema_version": CRAWL_CYCLE_SCHEMA_VERSION,
+        "rank": rank,
+        "num_sys": num_sys,
+        "crawl_cycle_number": number,
+        "cycle_started_at": now_time(),
+        "cities": list(cities),
+        "cities_fingerprint": fingerprint(cities),
+        "keyword_order": order,
+        "keyword_plan_fingerprint": plan_fingerprint(plan_pairs),
+        "shuffle_seed": seeds,
+        "current_keyword_index": 0,
+        "current_city_index": 0,
+        "current_page": 1,
+        "done_job_urls": [],
+        "cycle_complete": False,
+    }
+    save_crawl_cycle_state(state)
+
+    log("\n[CYCLE] CRAWL CYCLE %d opened -- keywords shuffled once for this "
+        "cycle." % number)
+    log("   keywords : %d   cities : %d   combos : %d"
+        % (len(order), len(cities), len(order) * len(cities)))
+    preview = ", ".join(keyword for _, keyword in order[:6])
+    log("   order    : %s%s" % (preview, " ..." if len(order) > 6 else ""))
+    return state
+
+
+def load_or_open_crawl_cycle(cities, plan_pairs):
+    """Resume the cycle in progress, or open the next one.  Never both.
+
+    The shuffle is gated on the cycle NUMBER alone, so a restart in the
+    middle of a cycle resumes the saved order instead of reshuffling.
+    """
+    state = load_crawl_cycle_state()
+    previous_number = int((state or {}).get("crawl_cycle_number", 0) or 0)
+
+    resumable = bool(
+        state
+        and not state.get("cycle_complete")
+        and state.get("keyword_order")
+        and state.get("cities")
+    )
+
+    if resumable and (state.get("rank") != rank
+                      or state.get("num_sys") != num_sys):
+        log("  [WARN] Saved cycle was rank=%s num_sys=%s but this process is "
+            "rank=%s num_sys=%s. The city slice is positional, so the saved "
+            "position means nothing here -- opening a fresh cycle."
+            % (state.get("rank"), state.get("num_sys"), rank, num_sys))
+        resumable = False
+
+    if not resumable:
+        return open_new_crawl_cycle(cities, plan_pairs, previous_number)
+
+    if state.get("cities_fingerprint") != fingerprint(cities):
+        log("  [WARN] The rank's city list has CHANGED since cycle %d started "
+            "(saved %d, now %d). Finishing this cycle against the SAVED list; "
+            "the new list applies from the next cycle."
+            % (state["crawl_cycle_number"], len(state["cities"]), len(cities)))
+
+    if state.get("keyword_plan_fingerprint") != plan_fingerprint(plan_pairs):
+        log("  [WARN] The keyword plan has CHANGED since cycle %d started. "
+            "Finishing this cycle with the SAVED order so no keyword is "
+            "dropped or crawled twice inside it."
+            % state["crawl_cycle_number"])
+
+    state.setdefault("done_job_urls", [])
+    state["current_keyword_index"] = max(
+        0, int(state.get("current_keyword_index", 0)))
+    state["current_city_index"] = max(
+        0, int(state.get("current_city_index", 0)))
+    state["current_page"] = max(1, int(state.get("current_page", 1)))
+    return state
+
+
+def resume_position(state):
+    """``(keyword_index, city_index, page)`` from the saved order.
+
+    Indices rather than a name scan, so "Bengaluru" and "Bangalore" in the
+    same rank can never be confused and resume is O(1).
+    """
+    order = state.get("keyword_order") or []
+    cities = state.get("cities") or []
+    keyword_index = min(max(0, int(state.get("current_keyword_index", 0))),
+                        len(order))
+    city_index = min(max(0, int(state.get("current_city_index", 0))),
+                     max(0, len(cities) - 1))
+    page = max(1, int(state.get("current_page", 1)))
+    return keyword_index, city_index, page
+
+
+def complete_crawl_cycle(state) -> None:
+    """Mark the cycle finished and clear the per-cycle progress."""
+    state["cycle_complete"] = True
+    state["completed_at"] = now_time()
+    state["current_keyword_index"] = len(state.get("keyword_order") or [])
+    state["current_city_index"] = 0
+    state["current_page"] = 1
+    state["done_job_urls"] = []
+    save_crawl_cycle_state(state)
+
+    # ONLY here: a cycle that was cut short by a block must not look finished.
+    reset_city_state()
+    reset_role_state()
+
+    log("\n[DONE] CRAWL CYCLE %d COMPLETE -- every keyword crawled across all "
+        "%d rank cities."
+        % (state["crawl_cycle_number"], len(state.get("cities") or [])))
+
+
+# ===========================================================================
+# THE CLIENT
+# ===========================================================================
+
+def build_client_config(verbose=None) -> IndeedClientConfig:
+    """Hand the client everything it needs, from THIS file's configuration."""
+    return IndeedClientConfig(
+        live_enabled=LIVE_COLLECTION_ENABLED,
+        base_url=os.environ.get(SOURCE_BASE_URL_ENV, ""),
+        api_key_env=SOURCE_API_KEY_ENV,
+        search_path=os.environ.get(SOURCE_SEARCH_PATH_ENV, ""),
+        detail_path=os.environ.get(SOURCE_DETAIL_PATH_ENV, ""),
+        results_per_page=RESULTS_PER_PAGE,
+        max_listing_pages=MAX_LISTING_PAGES,
+        request_timeout_seconds=HTTP_READ_TIMEOUT_SECONDS,
+        connect_timeout_seconds=HTTP_CONNECT_TIMEOUT_SECONDS,
+        max_retries_5xx=MAX_RETRIES_5XX,
+        backoff_5xx_seconds=BACKOFF_5XX_SECONDS,
+        max_retries_network=MAX_RETRIES_NETWORK,
+        backoff_network_seconds=BACKOFF_NETWORK_SECONDS,
+        max_retries_429=MAX_RETRIES_429,
+        backoff_429_seconds=BACKOFF_429_SECONDS,
+        default_429_wait_seconds=DEFAULT_429_WAIT_SECONDS,
+        retry_after_cap_seconds=RETRY_AFTER_CAP_SECONDS,
+        request_gap_seconds=REQUEST_GAP_SECONDS,
+        jitter_fraction=PACING_JITTER_FRACTION,
+        user_agent=HTTP_USER_AGENT,
+        fixture_dir=project_path(FIXTURE_DIR),
+        fixture_jobs_per_page=FIXTURE_JOBS_PER_PAGE,
+        fixture_seed=FIXTURE_SEED,
+        verbose=VERBOSE if verbose is None else verbose,
+    )
+
+
+def build_client(transport=None) -> IndeedClient:
+    client = IndeedClient(build_client_config(), transport=transport)
+    ok, message = client.preflight()
+    if not ok:
+        raise RuntimeError("the Indeed data source is not usable: %s" % message)
+    log("  [SOURCE] %s" % client.describe())
+    log("  [SOURCE] %s" % message)
+    return client
+
+
+# ===========================================================================
+# ONE (KEYWORD, CITY) COMBO
+# ===========================================================================
+
+def process_job(client, raw_job, input_row):
+    """One job: detail -> 32 columns -> apply url -> validate -> save.
+
+    Returns ``"saved"``, ``"skipped"`` or ``"failed"``.  A single bad job is
+    always a skip, never the end of the run.
+    """
+    reference = str(raw_job.get("source_url")
+                    or raw_job.get("job_key")
+                    or raw_job.get("title", ""))[:200]
+    try:
+        detail = client.get_job_detail(raw_job)
+    except IndeedAccessDenied as denied:
+        record_failed("detail", reference, "access denied: %s" % denied,
+                      status=denied.status, context=input_row,
+                      recovery_status="manual")
+        raise AccessBlocked(denied.status, reference, detail=str(denied),
+                            work_type="detail", scope=denied.scope,
+                            context=input_row)
+    except IndeedRateLimited as limited:
+        record_failed("detail", reference, "rate limited", status=429,
+                      context=input_row,
+                      retry_delay_seconds=limited.retry_after
+                      or DEFAULT_429_WAIT_SECONDS)
+        raise AccessBlocked(429, reference,
+                            wait_seconds=limited.retry_after,
+                            detail=str(limited), work_type="detail",
+                            context=input_row)
+    except (IndeedServerError, IndeedNetworkError) as error:
+        record_failed("detail", reference, str(error),
+                      status=getattr(error, "status", None),
+                      attempts=getattr(error, "attempts", 1),
+                      context=input_row)
+        return "failed"
+    except IndeedDataError as error:
+        record_failed("detail", reference, "unreadable job data: %s" % error,
+                      context=input_row)
+        return "failed"
+
+    try:
+        row = extract_job_details(
+            detail, input_row, state_resolver=city_state_name,
+            country=DEFAULT_COUNTRY, default_score=DEFAULT_JOB_SCORE,
+        )
+    except Exception as error:
+        # Incomplete or malformed job data: log it, keep going.
+        log("      ⚠️  Could not extract this job (%s: %s) -- skipping."
+            % (type(error).__name__, error))
+        record_failed("detail", reference, "extraction failed: %s" % error,
+                      context=input_row)
+        return "failed"
+
+    kind = row.get("_apply_url_kind")
+    if kind in ("missing", "invalid") and LOG_EVERY_ROW:
+        log("      🔗 apply_url left blank (%s: %s)"
+            % (kind, row.get("_apply_url_reason", "")))
+
+    saved = append_detail_to_excel(row)
+    if saved is None:
+        return "skipped"
+
+    mark_failed_resolved(reference)
+    return "saved"
+
+
+def run_combo(client, state, role_category, keyword, city, existing_data):
+    """Crawl every capped listing page for one (keyword, city) pair."""
+    state_name = city_state_name(city)
+
+    # The readable progress files keep being written, as in the reference
+    # project.  They are a log, not the resume authority.
+    save_city_state(city, max(1, int(state.get("current_page", 1))))
+    save_role_state(role_category, keyword)
+
+    log("\n  >> %s | %s, %s" % (keyword, city, state_name))
+
+    page_number = max(1, int(state.get("current_page", 1)))
+    total = None
+    saved_here = 0
+
+    while page_number <= MAX_LISTING_PAGES:
+        pacing_gate()
+        wait_for_internet()
+
+        context = {"keyword": keyword, "city": city, "page_number": page_number}
+        try:
+            jobs, total = client.search_jobs(keyword, city, page_number)
+        except IndeedAccessDenied as denied:
+            record_failed("listing", "%s|%s|p%d" % (keyword, city, page_number),
+                          "access denied: %s" % denied, status=denied.status,
+                          context=context, recovery_status="manual")
+            raise AccessBlocked(denied.status,
+                                "%s|%s|p%d" % (keyword, city, page_number),
+                                detail=str(denied), work_type="listing",
+                                scope=denied.scope, context=context)
+        except IndeedRateLimited as limited:
+            record_failed("listing", "%s|%s|p%d" % (keyword, city, page_number),
+                          "rate limited", status=429, context=context,
+                          retry_delay_seconds=limited.retry_after
+                          or DEFAULT_429_WAIT_SECONDS)
+            raise AccessBlocked(429,
+                                "%s|%s|p%d" % (keyword, city, page_number),
+                                wait_seconds=limited.retry_after,
+                                detail=str(limited), work_type="listing",
+                                context=context)
+        except (IndeedServerError, IndeedNetworkError, IndeedDataError) as error:
+            record_failed("listing", "%s|%s|p%d" % (keyword, city, page_number),
+                          str(error), status=getattr(error, "status", None),
+                          attempts=getattr(error, "attempts", 1),
+                          context=context)
+            log("     ⚠️  page %d unavailable (%s) -- queued, moving on."
+                % (page_number, type(error).__name__))
+            break
+
+        if page_number == 1:
+            pages = client.page_count(total, cap=MAX_LISTING_PAGES)
+            log("     %s job(s) reported -> %d page(s) to crawl (cap %d)"
+                % ("{:,}".format(total), pages, MAX_LISTING_PAGES))
+            if total == 0:
+                break
+
+        log("     page %d: %d listing(s)" % (page_number, len(jobs)))
+
+        already_done = set(state.get("done_job_urls") or [])
+
+        for raw_job in jobs:
+            job_url = str(raw_job.get("source_url")
+                          or raw_job.get("url")
+                          or raw_job.get("job_key") or "")
+            job_title = clean_value(raw_job.get("title")
+                                    or raw_job.get("job_title"))
+
+            if job_url and job_url in already_done:
+                log("       (already saved on this page -- skipping) %s"
+                    % job_title[:60])
+                continue
+
+            key = make_unique_key(role_category, job_title, city)
+            if key in existing_data:
+                entry = existing_data[key]
+                try:
+                    seen = int(entry.get("seen_count", 0))
+                except (TypeError, ValueError):
+                    seen = 0
+                entry["seen_count"] = seen + 1
+                entry["last_seen_at"] = now_time()
+                entry["is_active"] = 1
+                if not entry.get("sample_job_url"):
+                    entry["sample_job_url"] = job_url
+            else:
+                existing_data[key] = {
+                    "state": state_name,
+                    "role_category": role_category,
+                    "job_title": job_title,
+                    "location": city,
+                    "search_keyword": keyword,
+                    "sample_job_url": job_url,
+                    "first_seen_at": now_time(),
+                    "last_seen_at": now_time(),
+                    "seen_count": 1,
+                    "is_active": 1,
+                    "source_platform": SOURCE_PLATFORM,
+                    "source_type": "job_portal",
+                }
+
+            input_row = {
+                "state": state_name,
+                "role_category": role_category,
+                "job_title": job_title,
+                "location": city,
+                "city": city,
+                "search_keyword": keyword,
+                "source_platform": SOURCE_PLATFORM,
+                "source_type": "job_portal",
+            }
+
+            outcome = process_job(client, raw_job, input_row)
+            if outcome == "saved":
+                saved_here += 1
+
+            if job_url:
+                already_done.add(job_url)
+                state["done_job_urls"] = sorted(already_done)
+                # Checkpointed per job: a crash cannot lose or repeat a row.
+                save_crawl_cycle_state(state)
+
+            sleep_jitter(JOB_GAP_SECONDS)
+
+        save_master(pd.DataFrame(existing_data.values()))
+
+        if not jobs:
+            if page_number > 1:
+                log("     empty page -- stopping pagination early.")
+            break
+
+        # The checkpoint advances AFTER the page's work, never before it.
+        page_number += 1
+        state["current_page"] = page_number
+        state["done_job_urls"] = []
+        save_crawl_cycle_state(state)
+        save_city_state(city, page_number)
+
+        if total is not None and page_number > client.page_count(
+                total, cap=MAX_LISTING_PAGES):
+            break
+
+    state["current_page"] = 1
+    state["done_job_urls"] = []
+    return saved_here
+
+
+# ===========================================================================
+# THE FAILED-WORK REPLAY
+# ===========================================================================
+
+_COMBOS_SINCE_QUEUE = 0
+
+
+def queue_visit_due() -> bool:
+    global _COMBOS_SINCE_QUEUE
+    _COMBOS_SINCE_QUEUE += 1
+    if _COMBOS_SINCE_QUEUE >= QUEUE_CHECK_EVERY_COMBOS:
+        _COMBOS_SINCE_QUEUE = 0
+        return True
+    return False
+
+
+def process_failed_queue(client, existing_data) -> None:
+    """Replay a few eligible queued listings, under strict limits.
+
+    Runs only between combos, only on entries whose retry time has passed,
+    and never on an entry marked "manual" (an access refusal).  A queued item
+    that fails again is deferred, not retried in a loop.
+    """
+    batch = queue_eligible(QUEUE_BATCH_SIZE)
+    if not batch:
+        return
+
+    log("\n  [QUEUE] replaying %d queued item(s)." % len(batch))
+    for entry in batch:
+        keyword = entry.get("keyword")
+        city = entry.get("city")
+        page = int(entry.get("page_number") or 1)
+        if not keyword or not city:
+            defer_queue_entry(entry, "not enough context to replay")
+            continue
+
+        try:
+            jobs, _total = client.search_jobs(keyword, city, page)
+        except AccessBlocked:
+            raise
+        except IndeedAccessDenied:
+            defer_queue_entry(entry, "still refused")
+            return
+        except IndeedClientError as error:
+            defer_queue_entry(entry, str(error))
+            continue
+
+        role_category = entry.get("role_category") or ROLE_CATEGORY
+        recovered = 0
+        for raw_job in jobs:
+            input_row = {
+                "state": city_state_name(city),
+                "role_category": role_category,
+                "job_title": clean_value(raw_job.get("title")),
+                "location": city,
+                "city": city,
+                "search_keyword": keyword,
+                "source_platform": SOURCE_PLATFORM,
+                "source_type": "job_portal",
+            }
+            try:
+                if process_job(client, raw_job, input_row) == "saved":
+                    recovered += 1
+            except AccessBlocked:
+                defer_queue_entry(entry, "refused during replay")
+                raise
+        mark_failed_resolved(entry.get("reference"))
+        log("  [QUEUE] %s | %s page %d replayed: %d row(s) recovered."
+            % (keyword, city, page, recovered))
+
+    save_master(pd.DataFrame(existing_data.values()))
+
+
+# ===========================================================================
+# ONE COMPLETE CRAWL CYCLE
+# ===========================================================================
+
+def run_crawl_cycle(client, state, existing_data) -> str:
+    """Walk the cycle's frozen keyword order.  Returns "complete" when done.
+
+    Raises ScheduledPause for a scheduled stop and AccessBlocked for a 403 or
+    429, so the orchestrator can wait and resume from the checkpoint.  Neither
+    ever marks the cycle complete.
+    """
+    order = state["keyword_order"]
+    cities = state["cities"]
+    keyword_index, city_index, _page = resume_position(state)
+
+    while keyword_index < len(order):
+        role_category, keyword = order[keyword_index]
+
+        log("\n%s\nCYCLE %d | KEYWORD %d/%d: %s\n%s"
+            % ("=" * 72, state["crawl_cycle_number"], keyword_index + 1,
+               len(order), keyword, "=" * 72))
+
+        while city_index < len(cities):
+            state["current_keyword_index"] = keyword_index
+            state["current_city_index"] = city_index
+            save_crawl_cycle_state(state)
+
+            pacing_gate()
+
+            log("  [cycle %d | keyword %d/%d | city %d/%d | worked %s]"
+                % (state["crawl_cycle_number"], keyword_index + 1, len(order),
+                   city_index + 1, len(cities), human_duration(work_seconds())))
+
+            run_combo(client, state, role_category, keyword,
+                      cities[city_index], existing_data)
+
+            city_index += 1
+            state["current_city_index"] = city_index
+            state["current_page"] = 1
+            state["done_job_urls"] = []
+            save_crawl_cycle_state(state)
+
+            # A combo boundary is the only safe place to replay the queue:
+            # the checkpoint above is consistent and no job is in flight.
+            if queue_visit_due():
+                process_failed_queue(client, existing_data)
+
+            if city_index < len(cities):
+                sleep_jitter(CITY_GAP_SECONDS, "next city in")
+
+        keyword_index += 1
+        city_index = 0
+        state["current_keyword_index"] = keyword_index
+        state["current_city_index"] = 0
+        state["current_page"] = 1
+        state["done_job_urls"] = []
+        save_crawl_cycle_state(state)
+
+        if keyword_index < len(order):
+            sleep_jitter(KEYWORD_GAP_SECONDS, "next keyword in")
+
+    return "complete"
+
+
+# ===========================================================================
+# ORCHESTRATOR
+# ===========================================================================
+
+def install_signal_handlers() -> None:
+    """SIGINT and SIGTERM ask for a graceful stop at the next safe boundary.
+
+    ``systemctl stop`` sends SIGTERM, so the service stops with its
+    checkpoint saved rather than losing the page it was on.
+    """
+    def handler(signum, _frame):
+        global _SHUTDOWN_REQUESTED
+        if _SHUTDOWN_REQUESTED:
+            log("\n[STOP] Second signal (%s) -- exiting now." % signum)
+            raise SystemExit(1)
+        _SHUTDOWN_REQUESTED = True
+        log("\n[STOP] Signal %s received -- saving the checkpoint and "
+            "stopping at the next safe point." % signum)
+        if callable(_CHECKPOINT_SAVER):
+            try:
+                _CHECKPOINT_SAVER()
+            except Exception as error:               # pragma: no cover
+                log("[STOP] Checkpoint save failed: %s" % error)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):                # pragma: no cover
+            pass                                      # not the main thread
+
+
+def print_startup_banner(cities, plan_pairs, client) -> None:
+    log("\n" + "=" * 72)
+    log("INDEED COLLECTOR -- continuous keyword-first cycles")
+    log("=" * 72)
+    log("  project root       : %s" % BASE_DIR)
+    log("  rank / num_sys     : %s / %s" % (rank, num_sys))
+    log("  cities for rank %-2s : %d  (%s ... %s)"
+        % (rank, len(cities), cities[0], cities[-1]))
+    if role_plan_split is not None:
+        target, other, percent = role_plan_split()
+        log("  keywords in plan   : %d  (%d target + %d other IT = %.1f%% "
+            "target)" % (len(plan_pairs), target, other, percent))
+    else:
+        log("  keywords in plan   : %d" % len(plan_pairs))
+    log("  combos per cycle   : %s"
+        % "{:,}".format(len(plan_pairs) * len(cities)))
+    log("  listing page cap   : %d" % MAX_LISTING_PAGES)
+    log("  order              : department -> shuffled keyword -> all rank "
+        "cities -> pages -> jobs")
+    log("  night pause        : %s (%02d:00 - %02d:00 %s)"
+        % ("on" if NIGHT_PAUSE_ENABLED else "off", NIGHT_START_HOUR,
+           NIGHT_END_HOUR, TIMEZONE))
+    log("  work / break       : %.1f-%.1f h of WORKING time, then a random "
+        "%d-%d min break" % (WORK_PERIOD_MIN_HOURS, WORK_PERIOD_MAX_HOURS,
+                             WORK_BREAK_MIN_MINUTES, WORK_BREAK_MAX_MINUTES))
+    log("                       (pauses, night stops and cooldowns do not "
+        "count as working time)")
+    log("  cycle cooldown     : %d min" % CYCLE_COOLDOWN_MINUTES)
+    log("  crawl state        : %s" % CRAWL_CYCLE_STATE_FILE)
+    log("  excel working file : %s (archived every %d accepted rows as "
+        "current_data_cycleN.xlsx)" % (DETAIL_OUTPUT_FILE, EXCEL_BATCH_SIZE))
+    log("  excel master file  : %s" % MASTER_OUTPUT_FILE)
+    log("  excel archive #    : %d so far (cycle_state.json)" % load_cycle_num())
+    log("  data source        : %s" % client.describe())
+    if not LIVE_COLLECTION_ENABLED:
+        log("  ⚠️  LIVE COLLECTION IS DISABLED. No request reaches any Indeed")
+        log("      host. Rows written now are clearly-labelled fixture rows.")
+    log("=" * 72 + "\n")
+
+
+def load_existing_master_map() -> dict:
+    existing = {}
+    master = load_existing_master()
+    if not master.empty:
+        for _index, row in master.iterrows():
+            existing[make_unique_key(row.get("role_category", ""),
+                                     row.get("job_title", ""),
+                                     row.get("location", ""))] = row.to_dict()
+    return existing
+
+
+def main(max_cycles=None, client=None) -> int:
+    """Run crawl cycles until stopped, or ``max_cycles`` cycles for a test."""
+    global _CHECKPOINT_SAVER
+
+    install_signal_handlers()
+
+    cities_now = rank_cities()
+    plan_pairs = keyword_plan_pairs()
+    client = client or build_client()
+    print_startup_banner(cities_now, plan_pairs, client)
+
+    reset_work_timer()
+    block_cooldowns = 0
+    cycles_done = 0
+
+    while True:
+        if _SHUTDOWN_REQUESTED:
+            log("[STOP] Shutdown requested -- nothing in flight, exiting.")
+            return 0
+        if max_cycles is not None and cycles_done >= int(max_cycles):
+            return 0
+
+        try:
+            pacing_gate()
+        except ScheduledPause as pause:
+            sleep_long(pause.seconds, pause.reason)
+            if pause.reset_work_timer:
+                reset_work_timer()
+            continue
+        except KeyboardInterrupt:
+            return 0
+
+        state = load_or_open_crawl_cycle(cities_now, plan_pairs)
+        _CHECKPOINT_SAVER = lambda: save_crawl_cycle_state(state)   # noqa: E731
+
+        keyword_index, city_index, page_number = resume_position(state)
+        order = state["keyword_order"]
+        if (keyword_index, city_index, page_number) != (0, 0, 1) \
+                and keyword_index < len(order):
+            log("RESUMING cycle %d at keyword %d/%d (%s) | city %d/%d (%s) | "
+                "page %d"
+                % (state["crawl_cycle_number"], keyword_index + 1, len(order),
+                   order[keyword_index][1], city_index + 1,
+                   len(state["cities"]), state["cities"][city_index],
+                   page_number))
+
+        existing_data = load_existing_master_map()
+
+        try:
+            result = run_crawl_cycle(client, state, existing_data)
+
+        except ScheduledPause as pause:
+            save_crawl_cycle_state(state)
+            save_master(pd.DataFrame(existing_data.values()))
+            sleep_long(pause.seconds, pause.reason)
+            if pause.reset_work_timer:
+                reset_work_timer()
+            continue
+
+        except AccessBlocked as blocked:
+            # Decide what to step over BEFORE the break, so the resumed run
+            # does not walk straight back into the refused unit.
+            if blocked.scope != "session_wide":
+                if blocked.work_type == "detail":
+                    done = set(state.get("done_job_urls") or [])
+                    done.add(blocked.reference)
+                    state["done_job_urls"] = sorted(done)
+                    log("  -> isolated: this job is skipped; it stays in %s "
+                        "for later." % FAILED_PAGES_FILE)
+                else:
+                    failed_page = blocked.context.get("page_number")
+                    if failed_page:
+                        state["current_page"] = int(failed_page) + 1
+                        state["done_job_urls"] = []
+                        log("  -> isolated: listing page %d stays in %s; "
+                            "resuming at page %d."
+                            % (failed_page, FAILED_PAGES_FILE,
+                               int(failed_page) + 1))
+            save_crawl_cycle_state(state)
+            save_master(pd.DataFrame(existing_data.values()))
+
+            block_cooldowns += 1
+            if blocked.scope == "session_wide":
+                log("\n" + "=" * 72)
+                log("STOPPING. %s looks SESSION-WIDE: distinct references are "
+                    "being refused," % blocked.label)
+                log("so this is not one bad page. Working around an access "
+                    "control would be exactly")
+                log("the wrong response, so the run ends here with every "
+                    "checkpoint preserved:")
+                log("  cycle %d, keyword %d/%d, city %d/%d, page %d"
+                    % (state["crawl_cycle_number"],
+                       state["current_keyword_index"] + 1,
+                       len(state["keyword_order"]),
+                       state["current_city_index"] + 1, len(state["cities"]),
+                       state["current_page"]))
+                log("Queued in %s for review. No CAPTCHA handling, no proxy "
+                    "or IP rotation," % FAILED_PAGES_FILE)
+                log("no fingerprint spoofing.")
+                log("=" * 72)
+                return 2
+
+            if block_cooldowns > MAX_BLOCK_COOLDOWNS:
+                log("\n" + "=" * 72)
+                log("STOPPING. %s persisted through %d cooldown(s)."
+                    % (blocked.label, MAX_BLOCK_COOLDOWNS))
+                log("  last reference : %s" % blocked.reference)
+                log("The checkpoint is INTACT -- cycle %d, keyword %d/%d, "
+                    "city %d/%d, page %d --"
+                    % (state["crawl_cycle_number"],
+                       state["current_keyword_index"] + 1,
+                       len(state["keyword_order"]),
+                       state["current_city_index"] + 1, len(state["cities"]),
+                       state["current_page"]))
+                log("so re-running continues from exactly here once access is "
+                    "restored.")
+                log("=" * 72)
+                return 2
+
+            wait = max(ACCESS_BREAK_SECONDS, int(blocked.wait_seconds or 0))
+            sleep_long(wait, "%s access break %d/%d (checkpoint saved; the "
+                             "next real request tells us whether access is "
+                             "back)" % (blocked.label, block_cooldowns,
+                                        MAX_BLOCK_COOLDOWNS))
+            continue
+
+        except KeyboardInterrupt:
+            save_crawl_cycle_state(state)
+            save_master(pd.DataFrame(existing_data.values()))
+            log("\nStopped. Checkpoint saved -- re-run to continue from here.")
+            return 0
+
+        except Exception as error:
+            # One bad page must never end a run that has been collecting for
+            # hours.  Save, cool down, resume from the checkpoint.
+            save_crawl_cycle_state(state)
+            save_master(pd.DataFrame(existing_data.values()))
+            log("\n  [ERROR] %s: %s" % (type(error).__name__, error))
+            log("  Checkpoint saved. Cooling down, then resuming.")
+            sleep_long(UNEXPECTED_ERROR_COOLDOWN_SECONDS, "unexpected error")
+            continue
+
+        block_cooldowns = 0
+        save_master(pd.DataFrame(existing_data.values()))
+
+        if result == "complete":
+            complete_crawl_cycle(state)
+            cycles_done += 1
+
+            pending, due, manual, resolved = failed_queue_summary()
+            if pending or manual or resolved:
+                log("   %s: %d pending (%d due), %d needing manual attention, "
+                    "%d recovered."
+                    % (FAILED_PAGES_FILE, pending, due, manual, resolved))
+                if manual:
+                    log("   Entries marked 'manual' were refused access -- "
+                        "check the source agreement before retrying them.")
+
+            if max_cycles is not None and cycles_done >= int(max_cycles):
+                return 0
+
+            sleep_long(CYCLE_COOLDOWN_MINUTES * 60,
+                       "cooldown after crawl cycle %d (keywords reshuffle for "
+                       "cycle %d)" % (state["crawl_cycle_number"],
+                                      state["crawl_cycle_number"] + 1))
+            reset_work_timer()
+            continue
+
+        log("  [WARN] crawl cycle returned %r instead of 'complete' -- "
+            "cooling down before retrying from the checkpoint." % (result,))
+        sleep_long(UNEXPECTED_ERROR_COOLDOWN_SECONDS, "unexpected cycle result")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

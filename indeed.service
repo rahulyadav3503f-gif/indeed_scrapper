@@ -1,0 +1,42 @@
+# systemd unit for the independent Indeed collector.
+#
+# Installed by install_service.sh as /etc/systemd/system/indeed.service.
+# It is a SEPARATE unit with its own name: nothing here touches the Naukri
+# service, and the two can run side by side.
+[Unit]
+Description=JobEasyIndia Indeed job collector (independent unit)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/check_indeed
+
+# The project's own virtual environment when one exists; the installer
+# rewrites this line to the interpreter it found.
+ExecStart=/home/ubuntu/check_indeed/venv/bin/python /home/ubuntu/check_indeed/find_indeed_job.py
+
+# Graceful stop: SIGTERM asks the collector to save its checkpoint and stop
+# at the next safe boundary, so no listing page is abandoned half way.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=120
+
+Restart=on-failure
+RestartSec=60
+
+StandardOutput=append:/home/ubuntu/check_indeed/indeed.log
+StandardError=append:/home/ubuntu/check_indeed/indeed.log
+
+# Live collection stays off until an authorised source is configured.  To
+# enable it, set these in an environment file and flip
+# LIVE_COLLECTION_ENABLED at the top of find_indeed_job.py:
+#   INDEED_SOURCE_BASE_URL, INDEED_SEARCH_PATH, INDEED_DETAIL_PATH,
+#   INDEED_API_KEY
+# Credentials belong in the file below (chmod 600), never in git.
+EnvironmentFile=-/home/ubuntu/check_indeed/.env
+
+[Install]
+WantedBy=multi-user.target

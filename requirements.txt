@@ -1,0 +1,15 @@
+# Runtime dependencies for the independent Indeed collector.
+#
+#   pandas / openpyxl  the 32-column Excel output and its rollover
+#   requests           the live HTTP transport (only used when an authorised
+#                      source is configured; the offline fixture mode needs
+#                      nothing but the standard library)
+#   Levenshtein        fuzzy city -> state matching.  OPTIONAL: new_mylib.py
+#                      falls back to a pure-Python implementation when it is
+#                      not installed.
+#
+# The tests run on the standard library's unittest; pytest is not required.
+pandas>=1.5
+openpyxl>=3.0
+requests>=2.25
+Levenshtein>=0.20 ; python_version >= "3.8"

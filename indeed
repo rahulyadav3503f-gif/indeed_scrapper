@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# ./indeed -- start, stop, restart, status and log for the Indeed collector.
+#
+# Works in two modes, automatically:
+#   * systemd     when the unit "indeed" is installed (install_service.sh);
+#   * standalone  otherwise -- a background process tracked by indeed.pid.
+#
+# It only ever touches the service named "indeed".  The Naukri service is
+# never started, stopped or restarted from here.
+# ---------------------------------------------------------------------------
+set -u
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVICE_NAME="indeed"
+MAIN_SCRIPT="$PROJECT_DIR/find_indeed_job.py"
+PID_FILE="$PROJECT_DIR/indeed.pid"
+LOG_FILE="$PROJECT_DIR/indeed.log"
+
+if [ -x "$PROJECT_DIR/venv/bin/python" ]; then
+    PYTHON="$PROJECT_DIR/venv/bin/python"
+else
+    PYTHON="$(command -v python3)"
+fi
+
+have_systemd_unit() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE_NAME}\.service"
+}
+
+standalone_pid() {
+    [ -f "$PID_FILE" ] || return 1
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null)"
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    echo "$pid"
+}
+
+start_standalone() {
+    if pid="$(standalone_pid)"; then
+        echo "Already running (pid $pid)."
+        return 0
+    fi
+    cd "$PROJECT_DIR" || exit 1
+    nohup "$PYTHON" "$MAIN_SCRIPT" >>"$LOG_FILE" 2>&1 &
+    echo $! >"$PID_FILE"
+    sleep 1
+    if pid="$(standalone_pid)"; then
+        echo "Started (pid $pid). Log: $LOG_FILE"
+    else
+        echo "Failed to start -- see $LOG_FILE" >&2
+        tail -n 20 "$LOG_FILE" 2>/dev/null
+        return 1
+    fi
+}
+
+stop_standalone() {
+    if ! pid="$(standalone_pid)"; then
+        echo "Not running."
+        rm -f "$PID_FILE"
+        return 0
+    fi
+    # SIGTERM: the collector saves its checkpoint and stops at the next safe
+    # boundary.  Give it two minutes before insisting.
+    echo "Stopping (pid $pid) gracefully..."
+    kill -TERM "$pid" 2>/dev/null
+    for _ in $(seq 1 120); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "Still running after 120s -- sending SIGKILL."
+        kill -KILL "$pid" 2>/dev/null
+    fi
+    rm -f "$PID_FILE"
+    echo "Stopped. The checkpoint in crawl_cycle_state.json is intact."
+}
+
+case "${1:-}" in
+    start)
+        if have_systemd_unit; then
+            sudo systemctl start "$SERVICE_NAME" && \
+                systemctl --no-pager status "$SERVICE_NAME" | head -n 5
+        else
+            start_standalone
+        fi
+        ;;
+    stop)
+        if have_systemd_unit; then
+            sudo systemctl stop "$SERVICE_NAME" && echo "Stopped."
+        else
+            stop_standalone
+        fi
+        ;;
+    restart)
+        if have_systemd_unit; then
+            sudo systemctl restart "$SERVICE_NAME" && echo "Restarted."
+        else
+            stop_standalone
+            start_standalone
+        fi
+        ;;
+    status)
+        echo "project : $PROJECT_DIR"
+        echo "python  : $PYTHON"
+        if have_systemd_unit; then
+            systemctl --no-pager status "$SERVICE_NAME"
+        elif pid="$(standalone_pid)"; then
+            echo "state   : running (pid $pid)"
+        else
+            echo "state   : stopped"
+        fi
+        echo
+        echo "excel   : $(ls -1 "$PROJECT_DIR"/current_data*.xlsx 2>/dev/null | wc -l) workbook(s) in the project root"
+        if [ -f "$PROJECT_DIR/cycle_state.json" ]; then
+            echo "archives: $(cat "$PROJECT_DIR/cycle_state.json" | tr -d '\n ')"
+        fi
+        if [ -f "$PROJECT_DIR/crawl_cycle_state.json" ]; then
+            "$PYTHON" - "$PROJECT_DIR/crawl_cycle_state.json" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as handle:
+        state = json.load(handle)
+except Exception as error:
+    sys.exit("crawl   : state unreadable (%s)" % error)
+print("crawl   : cycle %s | keyword %s/%s | city %s/%s | page %s | complete=%s"
+      % (state.get("crawl_cycle_number"),
+         int(state.get("current_keyword_index", 0)) + 1,
+         len(state.get("keyword_order") or []),
+         int(state.get("current_city_index", 0)) + 1,
+         len(state.get("cities") or []),
+         state.get("current_page"), state.get("cycle_complete")))
+PYEOF
+        fi
+        ;;
+    log)
+        if have_systemd_unit && [ ! -f "$LOG_FILE" ]; then
+            journalctl -u "$SERVICE_NAME" -n 200 -f
+        else
+            echo "Tailing $LOG_FILE (Ctrl+C to stop)"
+            tail -n 200 -f "$LOG_FILE"
+        fi
+        ;;
+    *)
+        cat <<USAGE
+Usage: ./indeed {start|stop|restart|status|log}
+
+  start    run the collector (systemd unit if installed, else background)
+  stop     ask it to stop gracefully and save its checkpoint
+  restart  stop, then start
+  status   service state, Excel archive count and crawl position
+  log      follow the log
+
+Project: $PROJECT_DIR
+USAGE
+        exit 1
+        ;;
+esac

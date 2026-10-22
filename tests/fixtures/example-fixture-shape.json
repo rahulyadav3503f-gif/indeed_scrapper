@@ -1,0 +1,32 @@
+{
+  "total": 2,
+  "jobs": [
+    {
+      "job_key": "example0001",
+      "title": "Network Support Engineer",
+      "company_name": "Example Systems Pvt Ltd",
+      "company_website": "https://example-systems.invalid",
+      "formatted_location": "Pune, Maharashtra 411014",
+      "employment_type": "Full-time",
+      "salary_text": "₹4,00,000 - ₹6,50,000 a year",
+      "experience": "2 - 5 years",
+      "skills": ["Cisco", "LAN/WAN", "Troubleshooting"],
+      "posted_date": "2026-10-15T09:00:00Z",
+      "description": "<h3>About the role</h3><p>Keep the branch network running.</p><ul><li>Switching and routing</li><li>Incident response</li></ul>",
+      "source_url": "https://in.indeed.com/viewjob?jk=example0001",
+      "apply_url": "https://example-systems.invalid/careers/apply/1001"
+    },
+    {
+      "job_key": "example0002",
+      "title": "NOC Analyst",
+      "company_name": "Example Managed Services",
+      "formatted_location": "Remote",
+      "employment_type": "Contract",
+      "salary_text": "Not disclosed",
+      "posted_date": "3 days ago",
+      "description": "<p>Monitor customer infrastructure on a rotating shift.</p>",
+      "source_url": "https://in.indeed.com/viewjob?jk=example0002",
+      "indeed_apply_url": "https://in.indeed.com/applystart?jk=example0002"
+    }
+  ]
+}

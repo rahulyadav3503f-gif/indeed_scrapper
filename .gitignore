@@ -1,0 +1,37 @@
+# ---------------------------------------------------------------------------
+# Runtime output.  Every one of these is written directly into the project
+# root by design (there is no output folder); none of it belongs in git.
+# ---------------------------------------------------------------------------
+current_data.xlsx
+current_data_cycle*.xlsx
+indeed_it_jobs_by_city.xlsx
+*.xlsx
+.~lock.*
+
+# JSON checkpoints
+cycle_state.json
+crawl_cycle_state.json
+state_city.json
+state_role.json
+failed_pages.json
+
+# Atomic-write temporaries
+.*.tmp
+.*.tmp.xlsx
+
+# Logs and service artefacts
+*.log
+logs/
+indeed.pid
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
