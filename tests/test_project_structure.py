@@ -50,7 +50,15 @@ REQUIRED_SETTINGS = [
     "CYCLE_STATE_FILE", "CRAWL_CYCLE_STATE_FILE", "CITY_STATE_FILE",
     "ROLE_STATE_FILE", "FAILED_PAGES_FILE",
     "TIMEZONE",
-    "BROWSER_REQUIRED", "BROWSER_HEADLESS",
+    "INDEED_BASE_URL", "INDEED_SEARCH_URL_TEMPLATE", "INDEED_JOB_URL_TEMPLATE",
+    "INDEED_PAGE_STEP", "AUTH_FILE", "USE_SAVED_LOGIN",
+    "RESPECT_ROBOTS_DISALLOW", "ROBOTS_DISALLOWED_PREFIXES",
+    "COOKIE_BANNER_ACTION",
+    "LISTING_RENDER_TIMEOUT_MS", "DETAIL_RENDER_TIMEOUT_MS",
+    "BROWSER_REQUIRED", "BROWSER_VISIBLE", "BROWSER_HEADLESS",
+    "BROWSER_SLOW_MO_MS", "BROWSER_WIDTH", "BROWSER_HEIGHT",
+    "BROWSER_CHANNEL", "BROWSER_NAV_TIMEOUT_MS", "BROWSER_KEEP_OPEN_SECONDS",
+    "BROWSER_DEMO_PAGES",
 ]
 
 
@@ -122,7 +130,8 @@ class TestLayout(unittest.TestCase):
 
     def test_the_supporting_libraries_are_project_local(self):
         for name in ("new_mylib.py", "target_audience_roles.py",
-                     "requirements.txt", ".gitignore"):
+                     "save_indeed_login.py", "requirements.txt",
+                     ".gitignore"):
             self.assertTrue(os.path.exists(os.path.join(PROJECT_ROOT, name)),
                             name)
 
@@ -181,10 +190,60 @@ class TestConfigurationLivesInTheMainFile(unittest.TestCase):
                 if marker in line and "ENV" not in line and "env" not in line:
                     self.fail("possible credential in source: %s" % line)
 
-    def test_live_collection_is_off_by_default(self):
-        self.assertFalse(F.LIVE_COLLECTION_ENABLED,
-                         "live collection must stay disabled until an "
-                         "authorised source is configured")
+    def test_live_collection_settings_are_coherent(self):
+        """Live mode must have the urls it needs, and obey the robots rules.
+
+        The project collects from the live site (the operator's decision, the
+        same way the Naukri scraper does). What this test protects is that
+        turning it on cannot leave the collector without a url to build, and
+        that the robots-disallowed prefixes are never quietly emptied.
+        """
+        if F.LIVE_COLLECTION_ENABLED:
+            self.assertTrue(F.INDEED_BASE_URL.startswith("https://"))
+            self.assertIn("{keyword}", F.INDEED_SEARCH_URL_TEMPLATE)
+            self.assertIn("{city}", F.INDEED_SEARCH_URL_TEMPLATE)
+            self.assertIn("{start}", F.INDEED_SEARCH_URL_TEMPLATE)
+            self.assertIn("{job_key}", F.INDEED_JOB_URL_TEMPLATE)
+        self.assertTrue(F.RESPECT_ROBOTS_DISALLOW,
+                        "the robots rules must stay respected")
+        for prefix in ("/applystart", "/rc/", "/rpc/", "/my/"):
+            self.assertIn(prefix, F.ROBOTS_DISALLOWED_PREFIXES, prefix)
+        self.assertEqual(F.COOKIE_BANNER_ACTION, "reject",
+                         "the collector declines non-essential cookies; it "
+                         "never accepts on the operator's behalf")
+
+    def test_no_credential_handling_in_the_login_saver(self):
+        """save_indeed_login.py must never type or store a credential.
+
+        Only EXECUTABLE code is examined: the file's prose explains that the
+        operator types their own password, and that sentence is the point of
+        the file rather than a violation of it.
+        """
+        path = os.path.join(PROJECT_ROOT, "save_indeed_login.py")
+        self.assertTrue(os.path.isfile(path))
+        with open(path, encoding="utf-8") as handle:
+            source = handle.read()
+
+        tree = ast.parse(source)
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef,
+                                 ast.AsyncFunctionDef, ast.ClassDef)):
+                text = ast.get_docstring(node)
+                if text:
+                    docstrings.add(text)
+
+        code = code_lines(source)
+        for text in docstrings:
+            code = code.replace(text, "")
+
+        for forbidden in (".fill(", ".type(", "keyboard.insert_text",
+                          "set_password", "credentials"):
+            self.assertNotIn(forbidden, code,
+                             "the login saver must not handle credentials: %s"
+                             % forbidden)
+        self.assertIn("storage_state", code,
+                      "it saves the session the operator created")
 
 
 class TestNaukriIsolation(unittest.TestCase):

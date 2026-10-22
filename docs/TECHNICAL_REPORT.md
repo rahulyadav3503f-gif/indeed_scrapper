@@ -54,7 +54,11 @@ find_indeed_job.py
 └─ orchestrator       run_combo → run_crawl_cycle → main
         │
         └── source_file/
-              indeed_client.py     ── raw jobs in, typed errors out
+              indeed_client.py     ── owns Chromium; raw jobs in, typed
+                                      errors out
+                ├─ BrowserTransport  visible Chromium, DOM extraction
+                ├─ FixtureTransport  offline JSON records
+                └─ HttpTransport     an authorised JSON API
               indeed_extractor.py  ── raw job → 32 columns
               indeed_apply_url.py  ── raw job → validated apply url
 ```
@@ -68,8 +72,8 @@ the only thing that holds configuration.
 
 | | Naukri reference | Indeed project | Why |
 |-|------------------|----------------|-----|
-| Transport | Playwright browser, logged in with `naukri_auth.json` | HTTP/JSON client (or offline fixtures) | there is no authorised Indeed page-scraping route; a browser would only be used to defeat bot protection, which is out of scope |
-| Concurrency | `async`/`await` (required by Playwright) | synchronous | nothing here needs an event loop; synchronous code is easier to test and to reason about during a crash |
+| Transport | Playwright browser, logged in with `naukri_auth.json` | Playwright browser (default), or a JSON client, or offline fixtures | the operator wants to watch the run, as they can watch Naukri's. What the browser *navigates* differs: see "the visible browser" below |
+| Concurrency | `async`/`await` (Playwright's async API) | synchronous (Playwright's sync API) | nothing here needs an event loop; synchronous code is easier to test and to reason about during a crash |
 | Patch style | wrappers layered over originals, for historical reasons | one definition per function | a fresh project has no history to preserve; the *behaviour* of the active wrappers is implemented directly |
 | Battery check | `wait_for_battery()` via `psutil` | not carried over | the service runs on a server, and an unavailable battery sensor would be a pointless dependency. The internet check and its "waiting is not working" rule **are** carried over |
 | `current_row.json` | not used by the reference either | not created | the row pointer is part of the single atomic `crawl_cycle_state.json` write |
@@ -128,6 +132,70 @@ to what comes back —
   checkpoint (one bad job must never end a run);
 * `"complete"` → save the master, mark the cycle finished, report the queue,
   sleep the cooldown, reset the work timer, and open the next cycle.
+
+---
+
+## 4a. The visible browser
+
+Added on 22 October 2026, after the collector was found to be doing all of
+its work without ever opening a window. It never had: nothing in the project
+imported Playwright, so there was no browser to be headless *or* visible.
+
+### Where the code lives
+
+All of it is in `source_file/indeed_client.py`:
+
+| Piece | Responsibility |
+|-------|----------------|
+| `BrowserTransport.start/stop` | launch and tear down Chromium; two tabs (listing + job page), as the reference project does |
+| `BrowserTransport._goto` | navigate, then classify: 401/403 → `IndeedAccessDenied`, 429 → `IndeedRateLimited` (with `Retry-After`), 5xx → `IndeedServerError`, a challenge page on a 200 → `IndeedAccessDenied` |
+| `BrowserTransport._read_listing_cards` | JSON-LD first, then Indeed-shaped card selectors (`div.job_seen_beacon`, `[data-jk]`, `h2.jobTitle span[title]`, `[data-testid="company-name"]`, `[data-testid="text-location"]`, `[data-testid="attribute_snippet_testid"]`) |
+| `BrowserTransport._read_detail` | `h1.jobsearch-JobInfoHeader-title`, `[data-testid="inlineHeader-companyName"]`, `[data-testid="inlineHeader-companyLocation"]`, `#salaryInfoAndJobType`, `#jobDescriptionText`, with JSON-LD as the fallback for each |
+| `BrowserTransport._read_apply_candidates` | the apply button's `href` only — external (`#applyButtonLinkContainer a`) and Indeed-hosted (`#indeedApplyButton a`, `a[href*="/applystart"]`) |
+| `_split_salary_and_type` | a job page states pay and job type in ONE element ("₹4,00,000 - ₹6,00,000 a year - Full-time"); handing that whole string to the salary parser made it reject the figure, so the parts are separated where the page's format is known |
+| `DemoPageBuilder` | writes the demonstration pages into a temp directory (never into the project) and removes them at exit |
+
+The Naukri selectors were **not** reused: they look for
+`a[href*='job-listings']` and `jhc__*` classes, which do not exist on an
+Indeed page. The main script contains no Playwright code at all — a test
+asserts that `sync_playwright` and `chromium.launch` appear only in the
+client module.
+
+### Lifecycle
+
+`main()` calls `client.open()` at the start of each cycle attempt and
+`client.close()` before every long wait, so a collector that is paused for a
+45-minute cooldown does not leave a browser sitting on the desktop. A second
+SIGTERM closes the browser before exiting, and `DemoPageBuilder` registers an
+`atexit` hook, so a killed run leaves neither an orphaned Chromium process
+nor a page cache behind (both verified after a SIGTERM'd run).
+
+### What it navigates, and the two gates
+
+Default: **local demonstration pages**, banner-labelled, rows marked
+`fixture: true` with `demo.fixture.invalid` source urls.
+
+Live pages need BOTH `INDEED_BROWSER_AUTHORISED=yes` AND
+`INDEED_BROWSER_SEARCH_URL`. Authorisation without a url fails preflight;
+a url without authorisation stays a demonstration. No Indeed url is built in,
+which is the same rule the HTTP transport already followed.
+
+### What it refuses to do
+
+A challenge page, a 403 or a 429 ends that unit of work and is recorded in
+`failed_pages.json` (403 as `manual`, never auto-retried). There is no
+CAPTCHA handling, no proxy or IP rotation, no stealth plugin and no
+fingerprint spoofing; `slow_mo` is a debugging aid and is documented as one.
+Robots-disallowed paths are never opened — an `/applystart` link is recorded
+as a destination and left alone. The apply button is read, never clicked.
+
+### Display handling
+
+Visible mode with neither `DISPLAY` nor `WAYLAND_DISPLAY` set raises
+`BrowserUnavailable` with instructions, instead of hanging or failing
+cryptically. `indeed.service` carries commented-out `Environment=DISPLAY=:0`
+lines for a desktop session, and recommends `BROWSER_HEADLESS = True` for an
+unattended server.
 
 ---
 
@@ -217,7 +285,10 @@ and any quota the source publishes takes precedence.
 
 ## 9. Live access assessment
 
-There is no authorised self-serve Indeed job-search API as of October 2026.
+There is no authorised self-serve Indeed job-search API as of October 2026,
+and automated collection from Indeed's own pages is not permitted either --
+which is why the visible browser ships pointed at local demonstration pages
+rather than at indeed.com.
 The Publisher API and XML feed were retired in 2024; the remaining partner
 APIs are employer-side and return no search results; the site's robots rules
 disallow the apply and RPC paths. `LIVE_COLLECTION_ENABLED` is therefore

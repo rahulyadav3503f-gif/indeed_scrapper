@@ -30,6 +30,19 @@ RestartSec=60
 StandardOutput=append:/home/ubuntu/check_indeed/indeed.log
 StandardError=append:/home/ubuntu/check_indeed/indeed.log
 
+# THE VISIBLE BROWSER AND systemd
+# find_indeed_job.py ships with BROWSER_VISIBLE = True / BROWSER_HEADLESS =
+# False, i.e. a Chromium window on the desktop.  A systemd service has no
+# display of its own, so pick one of these:
+#
+#   * run it on the desktop session's display -- uncomment the two lines
+#     below (and make sure the user has access to that display);
+#   * or set BROWSER_HEADLESS = True at the top of find_indeed_job.py, which
+#     is the right choice for an unattended server.
+#
+# Environment=DISPLAY=:0
+# Environment=XAUTHORITY=/home/ubuntu/.Xauthority
+
 # Live collection stays off until an authorised source is configured.  To
 # enable it, set these in an environment file and flip
 # LIVE_COLLECTION_ENABLED at the top of find_indeed_job.py:

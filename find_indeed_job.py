@@ -64,18 +64,47 @@ import pandas as pd
 rank = 1
 num_sys = 5
 
-# -- Access settings --------------------------------------------------------
-# Live collection must remain disabled until an authorised Indeed data source
-# is configured.  With it off, the client runs on offline fixtures and no
-# request reaches any Indeed host.
-LIVE_COLLECTION_ENABLED = False
+# -- Collection mode --------------------------------------------------------
+# True  -> the visible Chromium window collects from the LIVE Indeed site,
+#          the same way the Naukri scraper collects from Naukri.
+# False -> no live request is made; the browser walks local demonstration
+#          pages instead (useful for testing the pipeline offline).
+LIVE_COLLECTION_ENABLED = True
 
-# Where an authorised source lives, read from the environment so that no
-# endpoint and no credential is ever written into source control.
-#   INDEED_SOURCE_BASE_URL  e.g. https://api.authorised-partner.example/v2
-#   INDEED_SEARCH_PATH      e.g. jobs/search?q={keyword}&l={city}&page={page}
-#   INDEED_DETAIL_PATH      e.g. jobs/{job_key}
-#   INDEED_API_KEY          the credential (sent as a Bearer token)
+# -- The live site ---------------------------------------------------------
+# The search and job urls, in the same place the Naukri scraper keeps its
+# build_search_url().  {start} steps by INDEED_PAGE_STEP, which is how the
+# site's own "next page" link steps.
+INDEED_BASE_URL = "https://in.indeed.com"
+INDEED_SEARCH_URL_TEMPLATE = (
+    "{base}/jobs?q={keyword}&l={city}&start={start}&sort=date"
+)
+INDEED_JOB_URL_TEMPLATE = "{base}/viewjob?jk={job_key}"
+INDEED_PAGE_STEP = 10               # the site paginates in steps of 10
+
+# -- Saved login ------------------------------------------------------------
+# Produced by running  python3 save_indeed_login.py  once: a visible browser
+# opens, YOU sign in by hand, and the session is saved here.  The collector
+# only ever LOADS this file; it never reads, types or stores a credential.
+# Searching works signed out too, so a missing file is a warning, not an
+# error.
+AUTH_FILE = "indeed_auth.json"
+USE_SAVED_LOGIN = True
+
+# -- Access rules the collector obeys ---------------------------------------
+# Paths the site's robots.txt disallows for a general agent.  The collector
+# never opens one; an /applystart link is RECORDED as an application
+# destination and left alone.
+RESPECT_ROBOTS_DISALLOW = True
+ROBOTS_DISALLOWED_PREFIXES = ("/applystart", "/rc/", "/rpc/", "/my/", "/api/")
+# Cookie banner: "reject" clicks the decline control so the banner stops
+# covering the page.  "Accept all" is never pressed, and no other consent or
+# terms control is ever touched.
+COOKIE_BANNER_ACTION = "reject"
+
+# -- Optional JSON data source (unused while the browser collects) ----------
+# If an authorised JSON API is ever available, these environment variables
+# point the HTTP transport at it without editing this file.
 SOURCE_BASE_URL_ENV = "INDEED_SOURCE_BASE_URL"
 SOURCE_SEARCH_PATH_ENV = "INDEED_SEARCH_PATH"
 SOURCE_DETAIL_PATH_ENV = "INDEED_DETAIL_PATH"
@@ -111,7 +140,7 @@ CYCLE_COOLDOWN_MINUTES = 45     # rest between finished crawl cycles
 
 # -- Listing configuration --------------------------------------------------
 MAX_LISTING_PAGES = 10          # per (keyword, city) pair
-RESULTS_PER_PAGE = 20           # what one listing page holds
+RESULTS_PER_PAGE = 10           # results per listing page (= INDEED_PAGE_STEP)
 
 # -- Periodic breaks --------------------------------------------------------
 # After WORK_PERIOD hours of ACTUAL WORKING time (night stops, breaks,
@@ -184,12 +213,43 @@ DEFAULT_JOB_SCORE = 30
 DEFAULT_COUNTRY = "India"
 
 # -- Browser settings -------------------------------------------------------
-# This collector talks to a JSON data source over HTTP; it drives no browser,
-# so there is no headless flag, no user-data directory and no login file to
-# configure.  The settings a browser would need are listed here so that the
-# answer is in the configuration block rather than missing from it.
-BROWSER_REQUIRED = False
-BROWSER_HEADLESS = True                     # unused while BROWSER_REQUIRED is False
+# The collector drives a REAL Chromium window through Playwright, so the run
+# can be watched on the desktop exactly as the Naukri scraper can be.
+#
+#   BROWSER_VISIBLE   True  -> use Chromium for collection (the normal mode)
+#                     False -> no browser at all; use the JSON/fixture client
+#   BROWSER_HEADLESS  False -> the window is on screen.  True hides it, which
+#                              is what a server without a display needs.
+#   BROWSER_SLOW_MO_MS       slows each Playwright action down so a developer
+#                              can FOLLOW what the browser is doing.  It is a
+#                              debugging aid, not a bot-detection measure.
+BROWSER_VISIBLE = True
+BROWSER_HEADLESS = False
+BROWSER_SLOW_MO_MS = 300
+BROWSER_WIDTH = 1366
+BROWSER_HEIGHT = 768
+
+BROWSER_REQUIRED = True             # this collector needs a browser to run
+BROWSER_CHANNEL = ""                # "" = Playwright's own Chromium build
+BROWSER_NAV_TIMEOUT_MS = 45000
+BROWSER_KEEP_OPEN_SECONDS = 0       # hold the window open before closing
+LISTING_RENDER_TIMEOUT_MS = 12000   # wait for result cards to render
+DETAIL_RENDER_TIMEOUT_MS = 12000    # wait for the job description to render
+
+# WHICH PAGES THE BROWSER OPENS
+# With LIVE_COLLECTION_ENABLED = True it opens the live search and job pages
+# built from INDEED_SEARCH_URL_TEMPLATE / INDEED_JOB_URL_TEMPLATE above.
+# With it False it walks LOCAL DEMONSTRATION PAGES generated on this machine
+# and labelled as such, so the pipeline can be exercised offline.
+#
+# These environment variables override the templates without editing this
+# file (useful for a staging mirror or a licensed feed's own pages):
+#   INDEED_BROWSER_SEARCH_URL='https://.../jobs?q={keyword}&l={city}&start={start}'
+#   INDEED_BROWSER_DETAIL_URL='https://.../viewjob?jk={job_key}'
+BROWSER_DEMO_PAGES = True
+BROWSER_LIVE_ACK_ENV = "INDEED_BROWSER_AUTHORISED"
+BROWSER_LIVE_SEARCH_URL_ENV = "INDEED_BROWSER_SEARCH_URL"
+BROWSER_LIVE_DETAIL_URL_ENV = "INDEED_BROWSER_DETAIL_URL"
 
 # -- Logging ----------------------------------------------------------------
 VERBOSE = True
@@ -253,6 +313,7 @@ ROLE_CATEGORY = "IT Department"
 
 _SHUTDOWN_REQUESTED = False
 _CHECKPOINT_SAVER = None
+_CLIENT_CLOSER = None       # set in main(): closes the browser on shutdown
 
 
 # ===========================================================================
@@ -1297,6 +1358,35 @@ def build_client_config(verbose=None) -> IndeedClientConfig:
         fixture_jobs_per_page=FIXTURE_JOBS_PER_PAGE,
         fixture_seed=FIXTURE_SEED,
         verbose=VERBOSE if verbose is None else verbose,
+        # -- the visible browser, straight from the block at the top --------
+        browser_visible=BROWSER_VISIBLE and BROWSER_REQUIRED,
+        browser_headless=BROWSER_HEADLESS,
+        browser_slow_mo_ms=BROWSER_SLOW_MO_MS,
+        browser_width=BROWSER_WIDTH,
+        browser_height=BROWSER_HEIGHT,
+        browser_channel=BROWSER_CHANNEL,
+        browser_nav_timeout_ms=BROWSER_NAV_TIMEOUT_MS,
+        browser_keep_open_seconds=BROWSER_KEEP_OPEN_SECONDS,
+        browser_demo_pages=BROWSER_DEMO_PAGES,
+        browser_live_search_url=os.environ.get(
+            BROWSER_LIVE_SEARCH_URL_ENV, ""),
+        browser_live_detail_url=os.environ.get(
+            BROWSER_LIVE_DETAIL_URL_ENV, ""),
+        browser_live_authorised=str(
+            os.environ.get(BROWSER_LIVE_ACK_ENV, "")
+        ).strip().lower() in ("1", "yes", "true", "on"),
+        # -- the live site, same shape as the Naukri scraper ---------------
+        site_base_url=INDEED_BASE_URL,
+        search_url_template=INDEED_SEARCH_URL_TEMPLATE,
+        job_url_template=INDEED_JOB_URL_TEMPLATE,
+        page_step=INDEED_PAGE_STEP,
+        auth_file=project_path(AUTH_FILE),
+        use_saved_login=USE_SAVED_LOGIN,
+        cookie_banner_action=COOKIE_BANNER_ACTION,
+        respect_robots_disallow=RESPECT_ROBOTS_DISALLOW,
+        robots_disallowed_prefixes=ROBOTS_DISALLOWED_PREFIXES,
+        listing_render_timeout_ms=LISTING_RENDER_TIMEOUT_MS,
+        detail_render_timeout_ms=DETAIL_RENDER_TIMEOUT_MS,
     )
 
 
@@ -1674,7 +1764,13 @@ def install_signal_handlers() -> None:
     def handler(signum, _frame):
         global _SHUTDOWN_REQUESTED
         if _SHUTDOWN_REQUESTED:
-            log("\n[STOP] Second signal (%s) -- exiting now." % signum)
+            log("\n[STOP] Second signal (%s) -- closing the browser and "
+                "exiting now." % signum)
+            if callable(_CLIENT_CLOSER):
+                try:
+                    _CLIENT_CLOSER()
+                except Exception:
+                    pass
             raise SystemExit(1)
         _SHUTDOWN_REQUESTED = True
         log("\n[STOP] Signal %s received -- saving the checkpoint and "
@@ -1726,9 +1822,39 @@ def print_startup_banner(cities, plan_pairs, client) -> None:
     log("  excel master file  : %s" % MASTER_OUTPUT_FILE)
     log("  excel archive #    : %d so far (cycle_state.json)" % load_cycle_num())
     log("  data source        : %s" % client.describe())
-    if not LIVE_COLLECTION_ENABLED:
-        log("  ⚠️  LIVE COLLECTION IS DISABLED. No request reaches any Indeed")
-        log("      host. Rows written now are clearly-labelled fixture rows.")
+    if BROWSER_VISIBLE and BROWSER_REQUIRED:
+        log("  browser            : Chromium %s, %dx%d, slow_mo %dms"
+            % ("HEADLESS" if BROWSER_HEADLESS else "VISIBLE on %s"
+               % (os.environ.get("DISPLAY") or "<no DISPLAY set>"),
+               BROWSER_WIDTH, BROWSER_HEIGHT, BROWSER_SLOW_MO_MS))
+    if LIVE_COLLECTION_ENABLED:
+        log("  live site          : %s" % INDEED_BASE_URL)
+        log("  search url         : %s"
+            % INDEED_SEARCH_URL_TEMPLATE.replace("{base}", ""))
+        auth_path = project_path(AUTH_FILE)
+        if USE_SAVED_LOGIN and os.path.exists(auth_path):
+            log("  saved login        : %s (loaded)" % AUTH_FILE)
+        elif USE_SAVED_LOGIN:
+            log("  saved login        : none -- running SIGNED OUT. Run "
+                "save_indeed_login.py")
+        else:
+            log("  saved login        : disabled")
+        log("  robots rules       : %s never opened"
+            % ", ".join(ROBOTS_DISALLOWED_PREFIXES))
+        log("  blocks             : a challenge, 403 or 429 STOPS that work "
+            "and is recorded;")
+        log("                       no CAPTCHA solving, no proxy rotation, "
+            "no fingerprint spoofing")
+    if getattr(client, "is_demonstration", True):
+        log("")
+        log("  " + "!" * 68)
+        log("  !! DEMONSTRATION MODE -- NOT LIVE INDEED DATA")
+        log("  !! LIVE_COLLECTION_ENABLED is False, so the browser walks")
+        log("  !! LOCAL DEMONSTRATION PAGES generated on this machine. No")
+        log("  !! request reaches Indeed, and every row written is a")
+        log("  !! labelled fixture row that must not be loaded into the")
+        log("  !! production database.")
+        log("  " + "!" * 68)
     log("=" * 72 + "\n")
 
 
@@ -1745,13 +1871,14 @@ def load_existing_master_map() -> dict:
 
 def main(max_cycles=None, client=None) -> int:
     """Run crawl cycles until stopped, or ``max_cycles`` cycles for a test."""
-    global _CHECKPOINT_SAVER
+    global _CHECKPOINT_SAVER, _CLIENT_CLOSER
 
     install_signal_handlers()
 
     cities_now = rank_cities()
     plan_pairs = keyword_plan_pairs()
     client = client or build_client()
+    _CLIENT_CLOSER = client.cleanup
     print_startup_banner(cities_now, plan_pairs, client)
 
     reset_work_timer()
@@ -1761,8 +1888,10 @@ def main(max_cycles=None, client=None) -> int:
     while True:
         if _SHUTDOWN_REQUESTED:
             log("[STOP] Shutdown requested -- nothing in flight, exiting.")
+            client.cleanup()
             return 0
         if max_cycles is not None and cycles_done >= int(max_cycles):
+            client.cleanup()
             return 0
 
         try:
@@ -1792,11 +1921,17 @@ def main(max_cycles=None, client=None) -> int:
         existing_data = load_existing_master_map()
 
         try:
+            # In browser mode this is where Chromium actually appears.  The
+            # window is opened per cycle attempt and closed again before any
+            # long wait, so a paused collector does not leave a browser
+            # sitting on the desktop for 45 minutes.
+            client.open()
             result = run_crawl_cycle(client, state, existing_data)
 
         except ScheduledPause as pause:
             save_crawl_cycle_state(state)
             save_master(pd.DataFrame(existing_data.values()))
+            client.close()
             sleep_long(pause.seconds, pause.reason)
             if pause.reset_work_timer:
                 reset_work_timer()
@@ -1823,6 +1958,7 @@ def main(max_cycles=None, client=None) -> int:
                                int(failed_page) + 1))
             save_crawl_cycle_state(state)
             save_master(pd.DataFrame(existing_data.values()))
+            client.close()
 
             block_cooldowns += 1
             if blocked.scope == "session_wide":
@@ -1843,6 +1979,7 @@ def main(max_cycles=None, client=None) -> int:
                     "or IP rotation," % FAILED_PAGES_FILE)
                 log("no fingerprint spoofing.")
                 log("=" * 72)
+                client.cleanup()
                 return 2
 
             if block_cooldowns > MAX_BLOCK_COOLDOWNS:
@@ -1860,6 +1997,7 @@ def main(max_cycles=None, client=None) -> int:
                 log("so re-running continues from exactly here once access is "
                     "restored.")
                 log("=" * 72)
+                client.cleanup()
                 return 2
 
             wait = max(ACCESS_BREAK_SECONDS, int(blocked.wait_seconds or 0))
@@ -1872,6 +2010,7 @@ def main(max_cycles=None, client=None) -> int:
         except KeyboardInterrupt:
             save_crawl_cycle_state(state)
             save_master(pd.DataFrame(existing_data.values()))
+            client.cleanup()
             log("\nStopped. Checkpoint saved -- re-run to continue from here.")
             return 0
 
@@ -1880,6 +2019,7 @@ def main(max_cycles=None, client=None) -> int:
             # hours.  Save, cool down, resume from the checkpoint.
             save_crawl_cycle_state(state)
             save_master(pd.DataFrame(existing_data.values()))
+            client.close()
             log("\n  [ERROR] %s: %s" % (type(error).__name__, error))
             log("  Checkpoint saved. Cooling down, then resuming.")
             sleep_long(UNEXPECTED_ERROR_COOLDOWN_SECONDS, "unexpected error")
@@ -1887,6 +2027,7 @@ def main(max_cycles=None, client=None) -> int:
 
         block_cooldowns = 0
         save_master(pd.DataFrame(existing_data.values()))
+        client.close()              # nothing in flight: let the window go
 
         if result == "complete":
             complete_crawl_cycle(state)
@@ -1902,6 +2043,7 @@ def main(max_cycles=None, client=None) -> int:
                         "check the source agreement before retrying them.")
 
             if max_cycles is not None and cycles_done >= int(max_cycles):
+                client.cleanup()
                 return 0
 
             sleep_long(CYCLE_COOLDOWN_MINUTES * 60,

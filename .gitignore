@@ -8,6 +8,9 @@ indeed_it_jobs_by_city.xlsx
 *.xlsx
 .~lock.*
 
+# The saved browser session from save_indeed_login.py -- a live login.
+indeed_auth.json
+
 # JSON checkpoints
 cycle_state.json
 crawl_cycle_state.json

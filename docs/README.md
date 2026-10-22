@@ -11,7 +11,8 @@ will know what every file does, how to run it, and what it writes where.
 
 ## 1. What this project does
 
-It walks a fixed plan:
+It drives a **visible Chromium window** (Playwright) and walks a fixed
+plan:
 
 ```
 for each of the 85 IT job keywords   (shuffled once per cycle)
@@ -43,7 +44,7 @@ periodic breaks.
 ├── find_indeed_job.py        the main script AND the only configuration file
 ├── source_file/
 │   ├── __init__.py
-│   ├── indeed_client.py      talks to the authorised data source
+│   ├── indeed_client.py      the browser + the data source
 │   ├── indeed_extractor.py   builds the 32-column row
 │   └── indeed_apply_url.py   finds the real application url
 ├── new_mylib.py              the 110 crawl cities + city → state lookup
@@ -107,14 +108,23 @@ Responsible for: retrieving listings, retrieving job details, pagination,
 and surviving temporary connection problems. It returns jobs **raw**, in
 whatever shape the source sent them; it never reshapes them.
 
-It has two transports:
+It owns the browser too: launching Chromium, closing it, navigating, and
+reading the rendered page all live here, and every setting arrives from the
+configuration block in the main file.
 
-* **FixtureTransport** (the default) reads `tests/fixtures/*.json`, and
-  generates deterministic fixture jobs when no file matches. This is what
-  lets the entire pipeline run and be tested today.
-* **HttpTransport** is the live one. It has **no built-in endpoint** — the
-  operator supplies the base url and paths through environment variables.
-  It cannot be pointed at Indeed by accident.
+It has three transports:
+
+* **BrowserTransport** (the default, section 12a) drives a visible Chromium
+  window. It reads listing cards and job pages out of the rendered DOM using
+  Indeed-shaped selectors and schema.org JSON-LD — not the Naukri selectors,
+  which do not exist on an Indeed page. With no authorised live source it
+  navigates local demonstration pages.
+* **FixtureTransport** reads `tests/fixtures/*.json`, and generates
+  deterministic fixture jobs when no file matches. Used when
+  `BROWSER_VISIBLE = False`, and as the data behind the demonstration pages.
+* **HttpTransport** is the JSON API one. It has **no built-in endpoint** —
+  the operator supplies the base url and paths through environment
+  variables. It cannot be pointed at Indeed by accident.
 
 Errors are typed, so the main script can respond correctly to each:
 `IndeedAccessDenied` (403 — stop, never work around it),
@@ -247,8 +257,9 @@ What was checked (October 2026):
   `/my/` for all user agents, and the site is behind bot protection.
   Scraping its pages is therefore out of scope for this project.
 
-So `LIVE_COLLECTION_ENABLED = False`, and the collector runs on offline
-fixtures. Fixture rows are labelled (`fixture: true`, `*.fixture.invalid`
+So `LIVE_COLLECTION_ENABLED = False`, the visible browser runs in
+demonstration mode against local pages (section 12a), and the collector
+produces fixture rows. Fixture rows are labelled (`fixture: true`, `*.fixture.invalid`
 hosts) and must never be loaded into the production database.
 
 To enable live collection once an authorised source exists:
@@ -276,7 +287,12 @@ cd /home/ubuntu/check_indeed
 python3 -m venv --system-site-packages venv
 source venv/bin/activate
 pip install -r requirements.txt
+python3 -m playwright install chromium
 ```
+
+The last line downloads the Chromium build Playwright drives. Without it the
+collector stops at startup with an explicit "run `python -m playwright
+install chromium`" message rather than failing obscurely.
 
 `Levenshtein` is optional — `new_mylib.py` falls back to a pure-Python
 implementation when it is not installed.
@@ -290,6 +306,9 @@ cd /home/ubuntu/check_indeed
 source venv/bin/activate
 python3 find_indeed_job.py
 ```
+
+A **visible Chromium window opens** and you can watch it work. See section
+12a for what it shows and how to change it.
 
 As a service:
 
@@ -307,6 +326,91 @@ runs the collector as a background process tracked by `indeed.pid`.
 `stop` sends SIGTERM, which asks the collector to save its checkpoint and
 stop at the next safe boundary. It only ever touches the service named
 `indeed`; the Naukri service is never started, stopped or restarted.
+
+---
+
+## 12a. The visible browser
+
+`python3 find_indeed_job.py` drives a real Chromium window through
+Playwright. You see it open, load a search page, open each job page, and move
+on — slowed down on purpose so the steps are followable.
+
+### The settings (top of `find_indeed_job.py`)
+
+```python
+BROWSER_VISIBLE = True        # use Chromium for collection
+BROWSER_HEADLESS = False      # False = the window is on your screen
+BROWSER_SLOW_MO_MS = 300      # pause between actions, so you can follow it
+BROWSER_WIDTH = 1366
+BROWSER_HEIGHT = 768
+
+BROWSER_REQUIRED = True       # the collector needs a browser
+BROWSER_CHANNEL = ""          # "" = Playwright's own Chromium build
+BROWSER_NAV_TIMEOUT_MS = 45000
+BROWSER_KEEP_OPEN_SECONDS = 0 # hold the window open before closing it
+BROWSER_DEMO_PAGES = True
+```
+
+* Watching it is too slow? Lower `BROWSER_SLOW_MO_MS` to `0`.
+* Running on a server with no screen? Set `BROWSER_HEADLESS = True`.
+  Visible mode with no `DISPLAY` stops with a clear error rather than hanging.
+* Want no browser at all (the old JSON/fixture client)? Set
+  `BROWSER_VISIBLE = False`.
+
+`slow_mo` exists so a developer can follow the run. It is not a
+bot-detection measure, and nothing in this project tries to look human.
+
+### What the window shows: DEMONSTRATION mode
+
+Live collection from Indeed is **not authorised** for this project
+(section 10), so by default the browser navigates **local fixture pages**
+generated on this machine into a temporary directory:
+
+* every page carries a red `DEMONSTRATION — … This is NOT Indeed` banner;
+* the pages are built to mirror the DOM of a real job page (the same card
+  containers, heading, company, location, salary chip, description block and
+  apply button), so the extraction you watch is the **same code** that would
+  run against an authorised live page;
+* the rows written carry `source_url` hosts like `demo.fixture.invalid`, so a
+  fixture row can never be mistaken for a real Indeed posting;
+* **no request reaches any Indeed host in this mode.**
+
+The startup banner says so in block capitals before any collecting starts.
+
+### Pointing the browser at pages you are permitted to collect
+
+Only when you have that permission, set all three in the environment (or in
+`.env`, `chmod 600`) and restart:
+
+```bash
+export INDEED_BROWSER_AUTHORISED=yes
+export INDEED_BROWSER_SEARCH_URL='https://<authorised-host>/jobs?q={keyword}&l={city}&start={start}'
+export INDEED_BROWSER_DETAIL_URL='https://<authorised-host>/viewjob?jk={job_key}'
+```
+
+Both halves are required: authorisation without a url is refused at startup,
+and a url without the acknowledgement stays a demonstration. There is no
+built-in Indeed url anywhere in the browser path — supplying one is you
+asserting that the collection is authorised.
+
+### What the browser never does
+
+* No CAPTCHA solving and no challenge bypassing. A verification page, a 403
+  or a 429 **stops** that work and is recorded; it is never worked around,
+  and no alternative route is tried.
+* No proxy or IP rotation, no stealth plugins, no fingerprint spoofing. The
+  user agent is Chromium's own.
+* No robots-disallowed path is opened. An Indeed-hosted `/applystart` link is
+  **recorded** as the application destination and left alone.
+* The Apply button's `href` is read; the button is never clicked. No
+  application is submitted and no resume is uploaded.
+
+### Running it as a service
+
+A systemd service has no display of its own. Either give the unit the
+desktop's display (`Environment=DISPLAY=:0` — the lines are in
+`indeed.service`, commented out), or set `BROWSER_HEADLESS = True`, which is
+the right answer for an unattended server.
 
 ---
 

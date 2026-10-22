@@ -1,6 +1,9 @@
 # Runtime dependencies for the independent Indeed collector.
 #
 #   pandas / openpyxl  the 32-column Excel output and its rollover
+#   playwright         the visible Chromium browser the collector drives.
+#                      After installing it, fetch the browser itself:
+#                          python -m playwright install chromium
 #   requests           the live HTTP transport (only used when an authorised
 #                      source is configured; the offline fixture mode needs
 #                      nothing but the standard library)
@@ -11,5 +14,6 @@
 # The tests run on the standard library's unittest; pytest is not required.
 pandas>=1.5
 openpyxl>=3.0
+playwright>=1.40
 requests>=2.25
 Levenshtein>=0.20 ; python_version >= "3.8"

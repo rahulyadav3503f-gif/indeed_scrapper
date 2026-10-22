@@ -24,6 +24,12 @@ from source_file.indeed_client import (            # noqa: E402
 )
 
 
+def F_BUILD_CONFIG():
+    """The configuration the main script actually builds."""
+    import find_indeed_job
+    return find_indeed_job.build_client_config(verbose=False)
+
+
 def offline_client(**overrides):
     config = IndeedClientConfig(verbose=False, request_gap_seconds=0,
                                 **overrides)
@@ -280,18 +286,65 @@ class TestLiveModeGuards(unittest.TestCase):
         finally:
             os.environ.pop("INDEED_TEST_KEY_NOT_SET", None)
 
-    def test_no_indeed_endpoint_is_hardcoded_in_the_client(self):
+    def test_the_client_builds_urls_from_configuration_not_from_itself(self):
+        """Every url the client requests comes from the main file's settings.
+
+        The site, the search url and the job url are configuration, so they
+        can be changed, pointed at a staging mirror, or switched off in one
+        place -- the client hardcodes no request url of its own.
+        """
         with open(os.path.join(PROJECT_ROOT, "source_file",
                                "indeed_client.py"), encoding="utf-8") as handle:
             source = handle.read()
-        code_lines = [line for line in source.splitlines()
-                      if not line.strip().startswith("#")]
-        code = "\n".join(code_lines)
-        # The docstring names indeed.com when explaining the access review;
-        # no executable line may contain a request url for it.
+        code = "\n".join(line for line in source.splitlines()
+                          if not line.strip().startswith("#"))
         for marker in ("https://in.indeed.com/jobs", "api.indeed.com",
                        "indeed.com/rpc", "publisher="):
-            self.assertNotIn(marker, code)
+            self.assertNotIn(marker, code, marker)
+
+    def test_configured_urls_build_correctly(self):
+        config = IndeedClientConfig(
+            live_enabled=True, browser_visible=True, verbose=False,
+            site_base_url="https://example.invalid",
+            search_url_template="{base}/jobs?q={keyword}&l={city}&start={start}",
+            job_url_template="{base}/viewjob?jk={job_key}",
+            page_step=10)
+        self.assertEqual(
+            config.live_search_url("Network Engineer", "Pune", 1),
+            "https://example.invalid/jobs?q=Network+Engineer&l=Pune&start=0")
+        self.assertEqual(
+            config.live_search_url("Network Engineer", "Pune", 4),
+            "https://example.invalid/jobs?q=Network+Engineer&l=Pune&start=30")
+        self.assertEqual(config.live_job_url("ab12"),
+                         "https://example.invalid/viewjob?jk=ab12")
+
+    def test_a_bad_url_template_is_a_configuration_error(self):
+        config = IndeedClientConfig(
+            live_enabled=True, site_base_url="https://example.invalid",
+            search_url_template="{base}/jobs?q={nonexistent}")
+        with self.assertRaises(IndeedConfigError):
+            config.live_search_url("a", "b", 1)
+
+    def test_robots_disallowed_paths_are_refused(self):
+        config = IndeedClientConfig(
+            site_base_url="https://example.invalid",
+            robots_disallowed_prefixes=("/applystart", "/rc/", "/rpc/",
+                                        "/my/", "/api/"))
+        for refused in ("https://example.invalid/applystart?jk=x",
+                        "https://example.invalid/rc/clk?jk=x",
+                        "https://example.invalid/rpc/jobdescs",
+                        "https://example.invalid/my/jobs",
+                        "https://example.invalid/api/fetch/mc-anon"):
+            self.assertTrue(config.robots_refuses(refused), refused)
+        for allowed in ("https://example.invalid/jobs?q=a&l=b",
+                        "https://example.invalid/viewjob?jk=x",
+                        "https://example.invalid/cmp/Acme"):
+            self.assertEqual(config.robots_refuses(allowed), "", allowed)
+
+    def test_the_robots_guard_cannot_be_emptied_by_accident(self):
+        config = F_BUILD_CONFIG()
+        self.assertTrue(config.respect_robots_disallow)
+        self.assertTrue(config.robots_disallowed_prefixes)
 
 
 if __name__ == "__main__":
