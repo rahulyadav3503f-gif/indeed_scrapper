@@ -422,7 +422,9 @@ python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 No pytest needed — the suite is standard-library `unittest`. See
-`docs/TEST_REPORT.md` for what is covered and the latest run.
+`docs/TEST_REPORT.md` for what is covered and the latest run, and
+`docs/PERFORMANCE_FIXES.md` for why a job used to take one to two minutes and
+what was changed to make it seconds.
 
 ---
 

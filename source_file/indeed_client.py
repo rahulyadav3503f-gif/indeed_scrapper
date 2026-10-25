@@ -784,6 +784,136 @@ BROWSER_EMPTY_MARKERS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# READING A PAGE IN ONE ROUND TRIP
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS
+# The first version of these readers walked the selector lists with Playwright
+# locators: `locator.count()`, then `locator.first.inner_text()`, for every
+# candidate of every field of every card. Measured on a real page that is
+# ~19 round trips PER CARD and ~24 for one job page -- and because `slow_mo`
+# is applied to each one, a 16-card listing page spent about 90 seconds inside
+# Playwright before a single job was even opened.
+#
+# The scripts below do the same work with ONE `page.evaluate()` call per page.
+# The selector lists stay in Python (they remain the single source of truth
+# and are passed in as data), the priority order is unchanged, and the result
+# is identical -- but the cost no longer scales with the number of cards or
+# with slow_mo.
+#
+# The locator-based readers are kept as a fallback for the case where
+# evaluate is unavailable, so nothing depends on JavaScript being allowed.
+
+_JS_PICK_HELPERS = r"""
+  const clean = (value) => String(value == null ? '' : value)
+      .replace(/\\s+/g, ' ').trim();
+  const pickText = (root, selectors) => {
+    for (const selector of selectors) {
+      let element = null;
+      try { element = root.querySelector(selector); } catch (e) { continue; }
+      if (!element) continue;
+      const text = clean(element.innerText || element.textContent || '');
+      if (text) return text;
+    }
+    return '';
+  };
+  const pickAttr = (root, selectors, attribute) => {
+    for (const selector of selectors) {
+      let element = null;
+      try { element = root.querySelector(selector); } catch (e) { continue; }
+      if (!element) continue;
+      const value = clean(element.getAttribute(attribute) || '');
+      if (value) return value;
+    }
+    return '';
+  };
+"""
+
+_JS_READ_CARDS = r"""
+(lists) => {
+%s
+  let cards = [];
+  for (const selector of lists.cards) {
+    let found = [];
+    try { found = document.querySelectorAll(selector); } catch (e) { continue; }
+    if (found.length) { cards = Array.from(found); break; }
+  }
+
+  const jobs = cards.map((card) => ({
+    job_key: clean(card.getAttribute('data-jk'))
+             || pickAttr(card, ['a[data-jk]'], 'data-jk'),
+    href: pickAttr(card, ['a[href]'], 'href'),
+    title: pickAttr(card, ['h2.jobTitle span[title]'], 'title')
+           || pickText(card, lists.title),
+    company_name: pickText(card, lists.company),
+    formatted_location: pickText(card, lists.location),
+    salary_text: pickText(card, lists.salary),
+    snippet: pickText(card, lists.snippet),
+  }));
+
+  return { jobs: jobs, total_text: pickText(document, lists.total) };
+}
+""" % _JS_PICK_HELPERS
+
+_JS_READ_DETAIL = r"""
+(lists) => {
+%s
+  let description = '';
+  for (const selector of lists.description) {
+    let element = null;
+    try { element = document.querySelector(selector); } catch (e) { continue; }
+    if (!element) continue;
+    const html = element.innerHTML || '';
+    if (html.trim()) { description = html; break; }
+  }
+
+  // Only the apply button's DESTINATION is read. Nothing is clicked.
+  return {
+    title: pickText(document, lists.title),
+    company_name: pickText(document, lists.company),
+    formatted_location: pickText(document, lists.location),
+    chips: pickText(document, lists.chips),
+    description: description,
+    apply_external: pickAttr(document, lists.apply_external, 'href'),
+    apply_hosted: pickAttr(document, lists.apply_hosted, 'href'),
+  };
+}
+""" % _JS_PICK_HELPERS
+
+_JS_BODY_SNIPPET = r"""
+() => (document.body ? (document.body.innerText || '') : '').slice(0, 4000)
+"""
+
+# Finds the "reject all" control and tags it, so Playwright can click it by
+# that marker. Only decline controls are matched -- "accept" appears nowhere.
+_JS_TAG_REJECT_BUTTON = r"""
+() => {
+  const wanted = ['reject all', 'reject all cookies', 'decline all',
+                  'decline all cookies', 'reject non-essential cookies'];
+  let nodes = [];
+  try {
+    nodes = Array.from(document.querySelectorAll(
+        '#onetrust-reject-all-handler, button, [role="button"], input[type="button"]'));
+  } catch (e) { return false; }
+  for (const node of nodes) {
+    const label = String(node.innerText || node.textContent || node.value || '')
+        .replace(/\s+/g, ' ').trim().toLowerCase();
+    if (node.id === 'onetrust-reject-all-handler' || wanted.includes(label)) {
+      node.setAttribute('data-collector-reject', '1');
+      return true;
+    }
+  }
+  return false;
+}
+"""
+
+_JS_READ_JSONLD = r"""
+() => Array.from(
+    document.querySelectorAll('script[type="application/ld+json"]')
+  ).map((node) => node.textContent || '')
+"""
+
+
 class BrowserUnavailable(IndeedClientError):
     """Playwright or Chromium is not usable on this machine."""
 
@@ -1000,6 +1130,9 @@ class BrowserTransport(BaseTransport):
         self.page = None            # the listing window
         self.detail_page = None     # the job window
         self.started = False
+        # The Playwright driver subprocess this transport launched, so an
+        # immediate stop can kill exactly that and nothing else.
+        self._driver_pid = None
 
         # Where the demonstration pages come from.  The fixture source is the
         # offline transport, so the demo shows exactly the fixture records the
@@ -1096,6 +1229,7 @@ class BrowserTransport(BaseTransport):
         if self.is_demonstration:
             self._show_demonstration_notice()
 
+        self._driver_pid = self._find_driver_pid()
         self.started = True
         _log(self.config, "   [BROWSER] Chromium %s -- %s"
              % ("headless" if self.config.browser_headless
@@ -1155,26 +1289,13 @@ class BrowserTransport(BaseTransport):
 
         self.context = self.browser = self.page = self.detail_page = None
         self._playwright = None
+        self._driver_pid = None
         self.started = False
 
     close = stop
 
-    def kill(self):
-        """Terminate Chromium NOW, without the polite close handshake.
-
-        ``stop()`` asks Playwright to close the context and the browser,
-        which needs the driver connection to be idle.  From inside a signal
-        handler it usually is not -- a navigation is in flight -- so the
-        close either blocks or comes back as "Connection closed while
-        reading from the driver".  For an immediate stop the driver and the
-        browser are killed instead; the operating system tidies up.
-
-        Never raises, whatever state the browser is in.
-        """
-        self.started = False
-
-        # 1) Playwright's own driver subprocess.  Killing it takes Chromium
-        #    with it, because the browser is the driver's child.
+    def _driver_proc(self):
+        """Playwright's own driver subprocess, when it can be reached."""
         for attribute_path in (
             ("_playwright", "_connection", "_transport", "_proc"),
             ("_playwright", "_transport", "_proc"),
@@ -1184,20 +1305,56 @@ class BrowserTransport(BaseTransport):
                 for attribute in attribute_path:
                     target = getattr(target, attribute)
                 if target is not None:
-                    target.kill()
-                    break
+                    return target
             except Exception:
                 continue
+        return None
 
-        # 2) Anything of ours still standing (a detached browser process).
-        for pid in _child_pids():
+    def _find_driver_pid(self):
+        proc = self._driver_proc()
+        try:
+            return int(proc.pid) if proc is not None else None
+        except Exception:
+            return None
+
+    def kill(self):
+        """Terminate Chromium NOW, without the polite close handshake.
+
+        ``stop()`` asks Playwright to close the context and the browser,
+        which needs the driver connection to be idle.  From inside a signal
+        handler it usually is not -- a navigation is in flight -- so the
+        close either blocks or comes back as "Connection closed while
+        reading from the driver". For an immediate stop the driver is killed
+        instead, and the browser goes with it because it is the driver's own
+        child.
+
+        ONLY the driver this transport launched is killed. An earlier version
+        swept every child process of the collector, which could take down an
+        unrelated subprocess that happened to be running.
+
+        Never raises, whatever state the browser is in.
+        """
+        was_started = self.started
+        self.started = False
+
+        proc = self._driver_proc()
+        killed = False
+        if proc is not None:
             try:
-                os.kill(pid, signal.SIGKILL)
+                proc.kill()
+                killed = True
+            except Exception:
+                killed = False
+
+        if not killed and was_started and self._driver_pid:
+            try:
+                os.kill(self._driver_pid, signal.SIGKILL)
             except Exception:
                 pass
 
         self.context = self.browser = self.page = self.detail_page = None
         self._playwright = None
+        self._driver_pid = None
 
     def cleanup_pages(self):
         if self.pages is not None:
@@ -1218,19 +1375,22 @@ class BrowserTransport(BaseTransport):
         """
         if self.config.cookie_banner_action != "reject":
             return
-        for selector in ("#onetrust-reject-all-handler",
-                         "button#onetrust-reject-all-handler",
-                         "button:has-text('Reject All')",
-                         "button:has-text('Reject all')"):
-            try:
-                locator = page.locator(selector)
-                if locator.count() and locator.first.is_visible():
-                    locator.first.click(timeout=3000)
-                    _log(self.config, "     [BROWSER] declined non-essential "
-                                      "cookies")
-                    return
-            except Exception:
-                continue
+        # ONE round trip to find out whether there is a banner at all --
+        # and on every page after the first there is not. The script only
+        # tags the decline control with a marker attribute; the click itself
+        # still goes through Playwright, and "accept" is never looked for.
+        try:
+            found = page.evaluate(_JS_TAG_REJECT_BUTTON)
+        except Exception:
+            found = False
+        if not found:
+            return
+        try:
+            page.locator("[data-collector-reject='1']").first.click(
+                timeout=3000)
+            _log(self.config, "     [BROWSER] declined non-essential cookies")
+        except Exception:
+            pass
 
     def _goto(self, page, url, label):
         """Navigate, then classify what came back.  Never bypasses anything."""
@@ -1269,7 +1429,10 @@ class BrowserTransport(BaseTransport):
         # solved, and no alternative route is tried.
         body = ""
         try:
-            body = (page.inner_text("body") or "").lower()[:4000]
+            # Sliced inside the page: a job page's body text can be hundreds
+            # of kilobytes, and only the first few thousand characters are
+            # ever examined.
+            body = str(page.evaluate(_JS_BODY_SNIPPET) or "").lower()
         except Exception:
             pass
         if body and not any(marker in body for marker in BROWSER_EMPTY_MARKERS):
@@ -1311,6 +1474,30 @@ class BrowserTransport(BaseTransport):
             self._read_total(self.page, len(jobs))
         return {"jobs": jobs, "total": total, "source": url}
 
+    @staticmethod
+    def _wait_for_any(page, selectors, timeout_ms):
+        """Wait once for ANY of ``selectors`` to attach.
+
+        The candidates are joined into a single CSS selector list, so the
+        wait costs ONE timeout, not one per candidate. Waiting for them in
+        turn is what made a page that matched none of them stall for
+        len(selectors) x timeout -- measured at 60s for the listing
+        selectors and 84s for the job-page selectors, which is exactly the
+        "a job takes one to two minutes" the operator reported.
+
+        Returns True when something attached, False on the single timeout.
+        """
+        joined = ", ".join(selector for selector in selectors
+                           if ":has-text(" not in selector)
+        if not joined:
+            return False
+        try:
+            page.wait_for_selector(joined, timeout=timeout_ms,
+                                   state="attached")
+            return True
+        except Exception:
+            return False
+
     def _wait_for_cards(self, page):
         """Give the result cards time to render, then nudge the page.
 
@@ -1321,14 +1508,8 @@ class BrowserTransport(BaseTransport):
         nothing" as an empty result, not as a block -- _goto() has already
         ruled a block out.
         """
-        for selector in self._CARD_SELECTORS:
-            try:
-                page.wait_for_selector(
-                    selector, timeout=self.config.listing_render_timeout_ms,
-                    state="attached")
-                break
-            except Exception:
-                continue
+        self._wait_for_any(page, self._CARD_SELECTORS,
+                           self.config.listing_render_timeout_ms)
         # Lazily-rendered cards further down the page need the scroll.
         for _ in range(2):
             try:
@@ -1342,23 +1523,33 @@ class BrowserTransport(BaseTransport):
             pass
 
     def _wait_for_detail(self, page):
-        """Wait for the job description block to render."""
-        for selector in self._DETAIL_DESCRIPTION + self._DETAIL_TITLE:
-            try:
-                page.wait_for_selector(
-                    selector, timeout=self.config.detail_render_timeout_ms,
-                    state="attached")
-                return
-            except Exception:
-                continue
+        """Wait once for the job description (or at least the title) block."""
+        self._wait_for_any(page,
+                           self._DETAIL_DESCRIPTION + self._DETAIL_TITLE,
+                           self.config.detail_render_timeout_ms)
+
+    # Where a results page states how many jobs it found.
+    _TOTAL_SELECTORS = (
+        "div.jobsearch-JobCountAndSortPane-jobCount span",
+        "div.jobsearch-JobCountAndSortPane-jobCount",
+        "[data-testid='searchCountPages']",
+        "#searchCountPages",
+        ".jobsearch-JobCountAndSortPane-jobCount",
+    )
 
     def _read_total(self, page, fallback):
-        """The result count the page itself states, else what we can see."""
-        for selector in ("div.jobsearch-JobCountAndSortPane-jobCount span",
-                         "div.jobsearch-JobCountAndSortPane-jobCount",
-                         "[data-testid='searchCountPages']",
-                         "#searchCountPages",
-                         ".jobsearch-JobCountAndSortPane-jobCount"):
+        """The result count the page itself states, else what we can see.
+
+        The in-page read already collected this text, so the normal path
+        costs no extra round trip at all.
+        """
+        text = getattr(self, "_last_total_text", "")
+        if text:
+            match = re.search(r"([\d,]{1,12})", text.replace(" ", ""))
+            if match:
+                return int(match.group(1).replace(",", ""))
+
+        for selector in self._TOTAL_SELECTORS:
             try:
                 if page.locator(selector).count():
                     text = page.locator(selector).first.inner_text()
@@ -1414,12 +1605,70 @@ class BrowserTransport(BaseTransport):
         """Read the rendered listing page into raw job dicts.
 
         JSON-LD first when the page publishes it (schema.org JobPosting is
-        the stable, documented structure); the card DOM otherwise.
+        the stable, documented structure); the card DOM otherwise, in ONE
+        round trip (see "READING A PAGE IN ONE ROUND TRIP" above).
         """
         jobs = self._read_json_ld_jobs(page)
         if jobs:
             return jobs
 
+        jobs = self._read_listing_cards_fast(page)
+        if jobs is not None:
+            return jobs
+        return self._read_listing_cards_via_locators(page)
+
+    def _read_listing_cards_fast(self, page):
+        """Every card, every field, in one evaluate.  None if that failed."""
+        try:
+            payload = page.evaluate(_JS_READ_CARDS, {
+                "cards": list(self._CARD_SELECTORS),
+                "title": list(self._TITLE_SELECTORS),
+                "company": list(self._COMPANY_SELECTORS),
+                "location": list(self._LOCATION_SELECTORS),
+                "salary": list(self._SALARY_SELECTORS),
+                "snippet": list(self._SNIPPET_SELECTORS),
+                "total": list(self._TOTAL_SELECTORS),
+            })
+        except Exception as error:
+            _log(self.config, "     [BROWSER] in-page read unavailable (%s) "
+                              "-- falling back to per-element reads"
+                 % type(error).__name__)
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        self._last_total_text = str(payload.get("total_text") or "")
+
+        jobs = []
+        for raw in payload.get("jobs") or []:
+            if not isinstance(raw, dict):
+                continue
+            job_key = str(raw.get("job_key") or "")
+            href = str(raw.get("href") or "")
+            title = str(raw.get("title") or "")
+            if not job_key and href:
+                match = re.search(r"[?&](?:jk|vjk)=([A-Za-z0-9_-]+)", href)
+                if match:
+                    job_key = match.group(1)
+            if not title:
+                continue
+            jobs.append({
+                "job_key": job_key or _hash_key(href or title),
+                "title": title,
+                "company_name": str(raw.get("company_name") or ""),
+                "formatted_location": str(raw.get("formatted_location") or ""),
+                "salary_text": str(raw.get("salary_text") or ""),
+                "snippet": str(raw.get("snippet") or ""),
+                "detail_page_url": self._job_page_url(page, job_key, href),
+                "source_url": self._source_url_for(page, job_key, href),
+                "fixture": self.is_demonstration,
+                "collected_via": "browser",
+            })
+        return jobs
+
+    def _read_listing_cards_via_locators(self, page):
+        """The original per-element reader.  Slow, but needs no JavaScript."""
         cards = None
         for selector in self._CARD_SELECTORS:
             try:
@@ -1552,14 +1801,16 @@ class BrowserTransport(BaseTransport):
         """schema.org JobPosting blocks, when the page publishes them."""
         found = []
         try:
-            blocks = page.locator("script[type='application/ld+json']")
-            count = blocks.count()
+            # One evaluate for every JSON-LD block on the page, instead of a
+            # count() plus one inner_text() per block.
+            raw_blocks = page.evaluate(_JS_READ_JSONLD)
         except Exception:
             return found
+        if not isinstance(raw_blocks, list):
+            return found
 
-        for index in range(count):
+        for raw in raw_blocks:
             try:
-                raw = blocks.nth(index).inner_text(timeout=2000)
                 parsed = json.loads(raw)
             except Exception:
                 continue
@@ -1635,13 +1886,109 @@ class BrowserTransport(BaseTransport):
     )
 
     def _read_detail(self, page):
-        """Read the rendered job page.  Reads only -- it clicks nothing."""
-        detail = {}
+        """Read the rendered job page.  Reads only -- it clicks nothing.
 
+        One evaluate for the whole page, with the per-element reader as a
+        fallback.  Both apply the same selectors in the same order.
+        """
         json_ld = {}
         for job in self._read_json_ld_jobs(page):
             json_ld = job
             break
+
+        fields = self._read_detail_fast(page)
+        if fields is None:
+            return self._read_detail_via_locators(page, json_ld)
+        return self._merge_detail(fields, json_ld)
+
+    def _read_detail_fast(self, page):
+        """Title, company, location, chips, description and the apply hrefs."""
+        try:
+            payload = page.evaluate(_JS_READ_DETAIL, {
+                "title": list(self._DETAIL_TITLE),
+                "company": list(self._DETAIL_COMPANY),
+                "location": list(self._DETAIL_LOCATION),
+                "chips": list(self._DETAIL_CHIPS),
+                "description": list(self._DETAIL_DESCRIPTION),
+                "apply_external": list(self._APPLY_EXTERNAL_SELECTORS),
+                "apply_hosted": list(self._APPLY_HOSTED_SELECTORS),
+            })
+        except Exception as error:
+            _log(self.config, "       [BROWSER] in-page read unavailable (%s) "
+                              "-- falling back to per-element reads"
+                 % type(error).__name__)
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        external = self._tidy_apply_href(page, payload.get("apply_external"))
+        hosted = self._tidy_apply_href(page, payload.get("apply_hosted"))
+        return {
+            "title": str(payload.get("title") or ""),
+            "company_name": str(payload.get("company_name") or ""),
+            "formatted_location": str(payload.get("formatted_location") or ""),
+            "chips": str(payload.get("chips") or ""),
+            "description": str(payload.get("description") or ""),
+            "apply_url": external,
+            "indeed_apply_url": hosted,
+        }
+
+    def _tidy_apply_href(self, page, href):
+        """Absolute http(s) only; a file:// demo link is not a destination."""
+        href = str(href or "").strip()
+        if not href:
+            return ""
+        if not href.startswith(("http://", "https://")):
+            href = self._absolute(page, href)
+        if href.startswith("file://"):
+            return ""
+        return href
+
+    def _merge_detail(self, fields, json_ld):
+        """Fold the page's fields and its JSON-LD into one raw job."""
+        detail = {
+            "title": fields.get("title") or json_ld.get("title", ""),
+            "company_name": (fields.get("company_name")
+                             or json_ld.get("company_name", "")),
+            "formatted_location": (fields.get("formatted_location")
+                                   or json_ld.get("formatted_location", "")),
+        }
+
+        chips = fields.get("chips") or ""
+        if chips:
+            # A job page states the pay and the job type in ONE element,
+            # e.g. "Rs 4,00,000 - Rs 6,00,000 a year - Full-time".  Handing
+            # that whole string to the salary parser makes it reject the
+            # figure (the second half of the range is not a number), so the
+            # parts are separated here, where the page's format is known.
+            salary_part, employment_part = _split_salary_and_type(chips)
+            if salary_part:
+                detail["salary_text"] = salary_part
+            if employment_part:
+                detail["employment_type"] = employment_part
+
+        for key in ("salary_text", "employment_type", "posted_date",
+                    "expiry_date", "skills"):
+            if not detail.get(key) and json_ld.get(key):
+                detail[key] = json_ld[key]
+
+        detail["description"] = (fields.get("description")
+                                 or json_ld.get("description", ""))
+        if fields.get("apply_url"):
+            detail["apply_url"] = fields["apply_url"]
+        if fields.get("indeed_apply_url"):
+            detail["indeed_apply_url"] = fields["indeed_apply_url"]
+        return detail
+
+    def _read_detail_via_locators(self, page, json_ld=None):
+        """The original per-element reader.  Slow, but needs no JavaScript."""
+        detail = {}
+
+        json_ld = json_ld if json_ld is not None else {}
+        if not json_ld:
+            for job in self._read_json_ld_jobs(page):
+                json_ld = job
+                break
 
         detail["title"] = (self._first_text(page, self._DETAIL_TITLE)
                            or json_ld.get("title", ""))
@@ -1853,28 +2200,6 @@ def _job_from_json_ld(node, is_demo):
     if node.get("applicationContact") or node.get("directApply"):
         raw["directApply"] = node.get("directApply")
     return raw
-
-
-def _child_pids():
-    """The direct child process ids of this process, on Linux.
-
-    Read from /proc rather than through psutil, so the immediate-stop path
-    has no third-party dependency.  An empty list on anything unexpected --
-    this is a best-effort tidy-up, never a hard requirement.
-    """
-    pids = []
-    try:
-        task_dir = "/proc/self/task"
-        for tid in os.listdir(task_dir):
-            children_file = os.path.join(task_dir, tid, "children")
-            try:
-                with open(children_file) as handle:
-                    pids.extend(int(pid) for pid in handle.read().split())
-            except (OSError, ValueError):
-                continue
-    except OSError:
-        return []
-    return sorted(set(pids))
 
 
 def _hash_key(seed):

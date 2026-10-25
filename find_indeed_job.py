@@ -155,9 +155,9 @@ WORK_PERIOD_MAX_HOURS = 4.2
 
 # -- Request pacing ---------------------------------------------------------
 #MIN AND MAX
-REQUEST_GAP_SECONDS = 2.0       # polite gap between source requests
-JOB_GAP_SECONDS = 1.0           # between two job detail reads
-CITY_GAP_SECONDS = 5            # between two cities
+REQUEST_GAP_SECONDS = 5.0       # polite gap between source requests
+JOB_GAP_SECONDS = 10.0           # between two job detail reads
+CITY_GAP_SECONDS = 15            # between two cities
 KEYWORD_GAP_SECONDS = 15        # between two keywords
 PACING_JITTER_FRACTION = 0.35   # spreads the ranks apart; not evasion
 
@@ -227,9 +227,12 @@ DEFAULT_COUNTRY = "India"
 #   BROWSER_SLOW_MO_MS       slows each Playwright action down so a developer
 #                              can FOLLOW what the browser is doing.  It is a
 #                              debugging aid, not a bot-detection measure.
+#                              COST: the collector makes ~6 browser calls per
+#                              page, so 300ms adds about 2s per job. Set it
+#                              to 0 for full speed; the window stays visible.
 BROWSER_VISIBLE = True
 BROWSER_HEADLESS = False
-BROWSER_SLOW_MO_MS = 300
+BROWSER_SLOW_MO_MS = 350
 BROWSER_WIDTH = 1366
 BROWSER_HEIGHT = 768
 
@@ -237,8 +240,12 @@ BROWSER_REQUIRED = True             # this collector needs a browser to run
 BROWSER_CHANNEL = ""                # "" = Playwright's own Chromium build
 BROWSER_NAV_TIMEOUT_MS = 45000
 BROWSER_KEEP_OPEN_SECONDS = 0       # hold the window open before closing
-LISTING_RENDER_TIMEOUT_MS = 12000   # wait for result cards to render
-DETAIL_RENDER_TIMEOUT_MS = 12000    # wait for the job description to render
+# How long to wait for a page's own content to appear. These are MAXIMA:
+# a page that renders in 400ms is read in 400ms. They only bite when the
+# expected markup never appears at all, so they are the cap on how long a
+# page the collector cannot read may hold up the run.
+LISTING_RENDER_TIMEOUT_MS = 8000    # wait for result cards to render
+DETAIL_RENDER_TIMEOUT_MS = 6000     # wait for the job description to render
 
 # WHICH PAGES THE BROWSER OPENS
 # With LIVE_COLLECTION_ENABLED = True it opens the live search and job pages

@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -559,6 +560,298 @@ class TestBrowserLifecycle(unittest.TestCase):
                 self.assertTrue(job["fixture"])
         finally:
             client.cleanup()
+
+
+@needs_browser
+class TestPageReadingCost(unittest.TestCase):
+    """A page must cost a FIXED, small number of browser round trips.
+
+    The first implementation walked every selector candidate of every field
+    with its own Playwright call: ~19 round trips per listing card and ~24
+    for one job page. With slow_mo at 300ms that alone put ~90s on a 16-card
+    listing page. These tests pin the cost down so it cannot creep back.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.transport = BrowserTransport(browser_config())
+        cls.transport.start()
+        cls.config = cls.transport.config
+        cls.transport.pages.write_search_page("Network Engineer", "Pune", 1,
+                                              FIXTURE_JOBS, len(FIXTURE_JOBS))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.transport.stop()
+        cls.transport.cleanup_pages()
+
+    def count_calls(self, action):
+        """Run `action` and count the Playwright calls it makes."""
+        from playwright.sync_api import Locator, Page
+
+        calls = []
+        patched = []
+
+        def wrap(cls, name):
+            original = getattr(cls, name, None)
+            if original is None:
+                return
+
+            def counted(self, *args, **kwargs):
+                calls.append("%s.%s" % (cls.__name__, name))
+                return original(self, *args, **kwargs)
+
+            setattr(cls, name, counted)
+            patched.append((cls, name, original))
+
+        for name in ("count", "inner_text", "inner_html", "get_attribute",
+                     "text_content", "is_visible"):
+            wrap(Locator, name)
+        for name in ("evaluate", "inner_text", "content", "goto",
+                     "wait_for_selector"):
+            wrap(Page, name)
+        try:
+            result = action()
+        finally:
+            for cls, name, original in patched:
+                setattr(cls, name, original)
+        return result, calls
+
+    def open_listing(self):
+        url = self.transport.pages.search_page_url("Network Engineer",
+                                                   "Pune", 1)
+        self.transport._goto(self.transport.page, url, "cost test")
+
+    def test_a_listing_page_costs_one_evaluate_whatever_the_card_count(self):
+        self.open_listing()
+        jobs, calls = self.count_calls(
+            lambda: self.transport._read_listing_cards(self.transport.page))
+        self.assertEqual(len(jobs), len(FIXTURE_JOBS))
+        evaluates = [call for call in calls if call == "Page.evaluate"]
+        self.assertLessEqual(len(evaluates), 2,
+                             "one evaluate for JSON-LD, one for the cards")
+        self.assertEqual([call for call in calls
+                          if call.startswith("Locator.")], [],
+                         "no per-element reads: %s" % calls)
+
+    def test_a_job_page_costs_one_evaluate(self):
+        self.open_listing()
+        cards = self.transport._read_listing_cards(self.transport.page)
+        self.transport._goto(self.transport.detail_page,
+                             cards[0]["detail_page_url"], "cost test")
+        _fields, calls = self.count_calls(
+            lambda: self.transport._read_detail(self.transport.detail_page))
+        self.assertLessEqual(len([c for c in calls if c == "Page.evaluate"]), 2)
+        self.assertEqual([c for c in calls if c.startswith("Locator.")], [],
+                         "no per-element reads: %s" % calls)
+
+    def test_the_whole_job_read_stays_in_single_figures(self):
+        """goto + render wait + challenge probe + JSON-LD + fields + cookies."""
+        self.open_listing()
+        cards = self.transport._read_listing_cards(self.transport.page)
+
+        def read_one_job():
+            return self.transport.detail(cards[1], self.config)
+
+        detail, calls = self.count_calls(read_one_job)
+        self.assertTrue(detail.get("title"))
+        self.assertLessEqual(len(calls), 10,
+                             "a job page should cost ~6 round trips, got "
+                             "%d: %s" % (len(calls), calls))
+
+
+@needs_browser
+class TestRenderWaitsAreBounded(unittest.TestCase):
+    """A page the collector cannot read must not hold up the run for minutes.
+
+    Waiting for each selector candidate in turn cost
+    len(selectors) x timeout -- 60s for the listing selectors and 84s for the
+    job-page selectors, which is what made one job take one to two minutes.
+    The candidates are now joined into a single wait.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.transport = BrowserTransport(browser_config())
+        cls.transport.start()
+        cls.tmp = tempfile.mkdtemp(prefix="indeed-bare-page-")
+        cls.bare = os.path.join(cls.tmp, "bare.html")
+        with open(cls.bare, "w", encoding="utf-8") as handle:
+            handle.write("<html><body><p>nothing familiar</p></body></html>")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.transport.stop()
+        cls.transport.cleanup_pages()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_the_candidates_are_joined_into_one_selector(self):
+        joined = ", ".join(self.transport._CARD_SELECTORS)
+        seen = {}
+
+        def record(selector, **kwargs):
+            seen["selector"] = selector
+            seen["timeout"] = kwargs.get("timeout")
+            raise RuntimeError("timed out")
+
+        page = type("FakePage", (), {"wait_for_selector": staticmethod(record)})()
+        self.assertFalse(self.transport._wait_for_any(
+            page, self.transport._CARD_SELECTORS, 1234))
+        self.assertEqual(seen["selector"], joined, "one joined selector")
+        self.assertEqual(seen["timeout"], 1234)
+
+    def test_playwright_specific_selectors_are_left_out_of_the_join(self):
+        seen = {}
+
+        def record(selector, **kwargs):
+            seen["selector"] = selector
+            return None
+
+        page = type("FakePage", (), {"wait_for_selector": staticmethod(record)})()
+        self.transport._wait_for_any(
+            page, ("div.card", "button:has-text('Reject All')"), 100)
+        self.assertEqual(seen["selector"], "div.card")
+
+    def test_an_unreadable_listing_page_costs_one_timeout(self):
+        self.transport.page.goto("file://" + self.bare)
+        budget = self.transport.config.listing_render_timeout_ms / 1000.0
+        started = time.monotonic()
+        self.transport._wait_for_cards(self.transport.page)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, budget + 4,
+                        "%.1fs for a %.0fs budget -- the waits are serial "
+                        "again" % (elapsed, budget))
+
+    def test_an_unreadable_job_page_costs_one_timeout(self):
+        self.transport.detail_page.goto("file://" + self.bare)
+        budget = self.transport.config.detail_render_timeout_ms / 1000.0
+        started = time.monotonic()
+        self.transport._wait_for_detail(self.transport.detail_page)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, budget + 2,
+                        "%.1fs for a %.0fs budget -- the waits are serial "
+                        "again" % (elapsed, budget))
+
+
+@needs_browser
+class TestFastAndSlowReadersAgree(unittest.TestCase):
+    """The in-page reader and the per-element fallback must agree.
+
+    The fallback exists for the case where evaluate is unavailable, so it has
+    to produce the same row -- otherwise the data would quietly depend on
+    which path ran.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.transport = BrowserTransport(browser_config())
+        cls.transport.start()
+        cls.config = cls.transport.config
+        cls.transport.pages.write_search_page("Network Engineer", "Pune", 1,
+                                              FIXTURE_JOBS, len(FIXTURE_JOBS))
+        url = cls.transport.pages.search_page_url("Network Engineer", "Pune", 1)
+        cls.transport._goto(cls.transport.page, url, "agreement test")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.transport.stop()
+        cls.transport.cleanup_pages()
+
+    def test_the_two_listing_readers_produce_the_same_cards(self):
+        fast = self.transport._read_listing_cards_fast(self.transport.page)
+        slow = self.transport._read_listing_cards_via_locators(
+            self.transport.page)
+        self.assertEqual(len(fast), len(slow))
+        for quick, careful in zip(fast, slow):
+            for field in ("job_key", "title", "company_name",
+                          "formatted_location", "salary_text", "source_url",
+                          "detail_page_url"):
+                self.assertEqual(quick[field], careful[field], field)
+
+    def test_the_two_detail_readers_produce_the_same_fields(self):
+        cards = self.transport._read_listing_cards(self.transport.page)
+        self.transport._goto(self.transport.detail_page,
+                             cards[0]["detail_page_url"], "agreement test")
+        fast = self.transport._read_detail(self.transport.detail_page)
+        slow = self.transport._read_detail_via_locators(
+            self.transport.detail_page)
+        for field in ("title", "company_name", "formatted_location",
+                      "salary_text", "employment_type", "apply_url"):
+            self.assertEqual(fast.get(field, ""), slow.get(field, ""), field)
+        self.assertEqual(fast.get("description", "").strip(),
+                         slow.get("description", "").strip())
+
+    def test_the_fallback_runs_when_evaluate_is_unavailable(self):
+        cards = self.transport._read_listing_cards(self.transport.page)
+        self.transport._goto(self.transport.detail_page,
+                             cards[0]["detail_page_url"], "fallback test")
+
+        original = self.transport.detail_page.evaluate
+
+        def refuse(*_args, **_kwargs):
+            raise RuntimeError("evaluate is blocked")
+
+        self.transport.detail_page.evaluate = refuse
+        try:
+            detail = self.transport._read_detail(self.transport.detail_page)
+        finally:
+            self.transport.detail_page.evaluate = original
+
+        self.assertEqual(detail["title"], "Network Support Engineer")
+        self.assertEqual(detail["apply_url"],
+                         "https://acme.example/careers/apply/77")
+
+
+@needs_browser
+class TestConsentBannerProbe(unittest.TestCase):
+    """One round trip to find the banner, and only decline controls."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.transport = BrowserTransport(browser_config())
+        cls.transport.start()
+        cls.tmp = tempfile.mkdtemp(prefix="indeed-consent-")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.transport.stop()
+        cls.transport.cleanup_pages()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def load(self, body):
+        path = os.path.join(self.tmp, "consent.html")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("<html><body>%s</body></html>" % body)
+        self.transport.page.goto("file://" + path)
+
+    def tagged(self):
+        from source_file.indeed_client import _JS_TAG_REJECT_BUTTON
+        return self.transport.page.evaluate(_JS_TAG_REJECT_BUTTON)
+
+    def test_the_onetrust_decline_button_is_found(self):
+        self.load('<button id="onetrust-reject-all-handler">Reject All</button>')
+        self.assertTrue(self.tagged())
+
+    def test_a_decline_button_is_found_by_its_label(self):
+        self.load("<button>Reject all</button>")
+        self.assertTrue(self.tagged())
+
+    def test_an_accept_button_is_never_tagged(self):
+        self.load('<button id="onetrust-accept-btn-handler">Accept All</button>'
+                  "<button>Accept all cookies</button>")
+        self.assertFalse(self.tagged(),
+                         "only decline controls may ever be clicked")
+
+    def test_a_page_with_no_banner_is_cheap_and_silent(self):
+        self.load("<p>no banner here</p>")
+        self.assertFalse(self.tagged())
+
+    def test_the_accept_path_does_not_exist_in_the_source(self):
+        with open(os.path.join(PROJECT_ROOT, "source_file",
+                               "indeed_client.py"), encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertNotIn("accept-btn-handler", source)
+        self.assertNotIn("Accept All", source)
 
 
 class TestSalaryAndTypeChip(unittest.TestCase):

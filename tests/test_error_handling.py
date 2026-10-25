@@ -243,10 +243,25 @@ class TestFailedQueue(ErrorTestCase):
 class TestNightPauseAndBreaks(ErrorTestCase):
 
     def test_night_window_detection(self):
+        """Derived from the CONFIGURED hours, not from assumed ones.
+
+        The window is an operator setting (it is 23:00-05:00 today, it was
+        00:00-06:00 before), so the expectation is computed from it rather
+        than hardcoded -- otherwise editing the configuration breaks a test
+        that is not about the configuration.
+        """
         F.NIGHT_PAUSE_ENABLED = True
-        inside = datetime(2026, 10, 21, 2, 0, 0)
-        outside = datetime(2026, 10, 21, 9, 0, 0)
-        self.assertEqual(F.night_seconds_remaining(inside), 4 * 3600)
+        start = int(F.NIGHT_START_HOUR) % 24
+        end = int(F.NIGHT_END_HOUR) % 24
+
+        # One hour into the window, whichever hour that is.
+        inside_hour = (start + 1) % 24
+        inside = datetime(2026, 10, 21, inside_hour, 0, 0)
+        expected = ((end - inside_hour) % 24) * 3600
+        self.assertEqual(F.night_seconds_remaining(inside), expected)
+
+        # An hour after it ends is outside it.
+        outside = datetime(2026, 10, 21, (end + 1) % 24, 0, 0)
         self.assertEqual(F.night_seconds_remaining(outside), 0)
 
     def test_the_window_may_cross_midnight(self):
@@ -498,6 +513,30 @@ class TestImmediateStopOnCtrlC(ErrorTestCase):
         transport.kill()                             # must not raise
         self.assertFalse(transport.started)
         self.assertIsNone(transport.browser)
+
+    def test_kill_only_touches_the_driver_it_launched(self):
+        """It must not sweep up unrelated child processes.
+
+        An earlier version SIGKILLed every direct child of the collector,
+        which could kill a subprocess that had nothing to do with the
+        browser.
+        """
+        import subprocess
+        from source_file.indeed_client import BrowserTransport
+
+        innocent = subprocess.Popen([sys.executable, "-c",
+                                     "import time; time.sleep(30)"])
+        try:
+            transport = BrowserTransport(IndeedClientConfig(
+                browser_visible=True, verbose=False))
+            transport.started = True                 # pretend it launched
+            transport._driver_pid = None             # but owns no driver
+            transport.kill()
+            self.assertIsNone(innocent.poll(),
+                              "an unrelated child process was killed")
+        finally:
+            innocent.kill()
+            innocent.wait(timeout=10)
 
 
 class TestInternetCheck(ErrorTestCase):
