@@ -45,6 +45,7 @@ import atexit
 import hashlib
 import json
 import os
+import signal
 import random
 import re
 import shutil
@@ -1158,6 +1159,46 @@ class BrowserTransport(BaseTransport):
 
     close = stop
 
+    def kill(self):
+        """Terminate Chromium NOW, without the polite close handshake.
+
+        ``stop()`` asks Playwright to close the context and the browser,
+        which needs the driver connection to be idle.  From inside a signal
+        handler it usually is not -- a navigation is in flight -- so the
+        close either blocks or comes back as "Connection closed while
+        reading from the driver".  For an immediate stop the driver and the
+        browser are killed instead; the operating system tidies up.
+
+        Never raises, whatever state the browser is in.
+        """
+        self.started = False
+
+        # 1) Playwright's own driver subprocess.  Killing it takes Chromium
+        #    with it, because the browser is the driver's child.
+        for attribute_path in (
+            ("_playwright", "_connection", "_transport", "_proc"),
+            ("_playwright", "_transport", "_proc"),
+        ):
+            target = self
+            try:
+                for attribute in attribute_path:
+                    target = getattr(target, attribute)
+                if target is not None:
+                    target.kill()
+                    break
+            except Exception:
+                continue
+
+        # 2) Anything of ours still standing (a detached browser process).
+        for pid in _child_pids():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+
+        self.context = self.browser = self.page = self.detail_page = None
+        self._playwright = None
+
     def cleanup_pages(self):
         if self.pages is not None:
             self.pages.cleanup()
@@ -1814,6 +1855,28 @@ def _job_from_json_ld(node, is_demo):
     return raw
 
 
+def _child_pids():
+    """The direct child process ids of this process, on Linux.
+
+    Read from /proc rather than through psutil, so the immediate-stop path
+    has no third-party dependency.  An empty list on anything unexpected --
+    this is a best-effort tidy-up, never a hard requirement.
+    """
+    pids = []
+    try:
+        task_dir = "/proc/self/task"
+        for tid in os.listdir(task_dir):
+            children_file = os.path.join(task_dir, tid, "children")
+            try:
+                with open(children_file) as handle:
+                    pids.extend(int(pid) for pid in handle.read().split())
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        return []
+    return sorted(set(pids))
+
+
 def _hash_key(seed):
     return "b%s" % hashlib.sha1(str(seed).encode("utf-8")).hexdigest()[:11]
 
@@ -1903,6 +1966,27 @@ class IndeedClient:
             except Exception:
                 pass
         return self
+
+    def kill(self):
+        """Stop the transport immediately -- no polite handshake.
+
+        Used by the Ctrl+C path, where a navigation is usually in flight and
+        a graceful close would block or fail.
+        """
+        killer = getattr(self.transport, "kill", None)
+        if callable(killer):
+            try:
+                killer()
+            except Exception:
+                pass
+        else:
+            self.close()
+        cleaner = getattr(self.transport, "cleanup_pages", None)
+        if callable(cleaner):
+            try:
+                cleaner()
+            except Exception:
+                pass
 
     def cleanup(self):
         """Close, and remove any temporary demonstration pages."""

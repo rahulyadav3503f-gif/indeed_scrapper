@@ -374,6 +374,132 @@ class TestGracefulShutdown(ErrorTestCase):
         self.assertTrue(os.path.exists(self.path(F.CRAWL_CYCLE_STATE_FILE)))
 
 
+class TestImmediateStopOnCtrlC(ErrorTestCase):
+    """Ctrl+C ends the process at once, and a repeat press does nothing."""
+
+    def setUp(self):
+        super().setUp()
+        import signal as signal_module
+        self.signal = signal_module
+        self._saved_handlers = {
+            sig: signal_module.getsignal(sig)
+            for sig in (signal_module.SIGINT, signal_module.SIGTERM)
+        }
+        self._saved_exit = F._exit
+        self._saved_saver = F._CHECKPOINT_SAVER
+        self._saved_killer = F._CLIENT_KILLER
+        self._saved_closer = F._CLIENT_CLOSER
+
+        self.events = []
+        F._exit = lambda code: self.events.append(("exit", code))
+        F._CHECKPOINT_SAVER = lambda: self.events.append(("saved", True))
+        F._CLIENT_KILLER = lambda: self.events.append(("killed", True))
+
+    def tearDown(self):
+        F._exit = self._saved_exit
+        F._CHECKPOINT_SAVER = self._saved_saver
+        F._CLIENT_KILLER = self._saved_killer
+        F._CLIENT_CLOSER = self._saved_closer
+        for sig, handler in self._saved_handlers.items():
+            try:
+                self.signal.signal(sig, handler)
+            except (ValueError, OSError):            # pragma: no cover
+                pass
+        super().tearDown()
+
+    def fire(self, signum):
+        handler = self.signal.getsignal(signum)
+        self.assertTrue(callable(handler), "no handler installed")
+        handler(signum, None)
+        return handler
+
+    def test_ctrl_c_saves_kills_and_exits_immediately(self):
+        F.STOP_IMMEDIATELY_ON_CTRL_C = True
+        F.install_signal_handlers()
+        self.fire(self.signal.SIGINT)
+
+        self.assertIn(("saved", True), self.events)
+        self.assertIn(("killed", True), self.events)
+        self.assertIn(("exit", 130), self.events)
+        self.assertEqual([name for name, _ in self.events].count("exit"), 1,
+                         "the process ends exactly once")
+
+    def test_the_browser_is_killed_not_politely_closed(self):
+        """A polite close cannot run while a navigation is in flight."""
+        F.STOP_IMMEDIATELY_ON_CTRL_C = True
+        F._CLIENT_CLOSER = lambda: self.events.append(("closed", True))
+        F.install_signal_handlers()
+        self.fire(self.signal.SIGINT)
+        self.assertIn(("killed", True), self.events)
+        self.assertNotIn(("closed", True), self.events)
+
+    def test_a_repeated_ctrl_c_is_ignored(self):
+        F.STOP_IMMEDIATELY_ON_CTRL_C = True
+        F.install_signal_handlers()
+        self.fire(self.signal.SIGINT)
+        # Both signals are disarmed by the handler itself, so a second press
+        # cannot re-enter it and print a second message.
+        self.assertEqual(self.signal.getsignal(self.signal.SIGINT),
+                         self.signal.SIG_IGN)
+        self.assertEqual(self.signal.getsignal(self.signal.SIGTERM),
+                         self.signal.SIG_IGN)
+        # SIG_IGN is an operating-system level ignore: a second Ctrl+C never
+        # reaches Python at all, so no second message can be printed.
+        self.assertEqual([name for name, _ in self.events].count("exit"), 1)
+
+    def test_no_further_work_is_queued_after_ctrl_c(self):
+        F.STOP_IMMEDIATELY_ON_CTRL_C = True
+        F.install_signal_handlers()
+        self.fire(self.signal.SIGINT)
+        self.assertEqual(F.load_failed_pages(), [],
+                         "an immediate stop must not queue a retry")
+
+    def test_a_service_stop_still_finishes_the_job_in_hand(self):
+        """SIGTERM keeps the graceful path, so systemd never cuts a job."""
+        F.STOP_IMMEDIATELY_ON_CTRL_C = True
+        F.install_signal_handlers()
+        self.fire(self.signal.SIGTERM)
+
+        self.assertTrue(F._SHUTDOWN_REQUESTED)
+        self.assertIn(("saved", True), self.events)
+        self.assertNotIn(("exit", 143), self.events)
+        with self.assertRaises(KeyboardInterrupt):
+            F.pacing_gate()                          # unwinds at the boundary
+
+    def test_a_second_service_stop_ends_the_process(self):
+        F.install_signal_handlers()
+        handler = self.signal.getsignal(self.signal.SIGTERM)
+        handler(self.signal.SIGTERM, None)           # first: graceful
+        F.install_signal_handlers()                  # re-arm, as a run would
+        self.signal.getsignal(self.signal.SIGTERM)(self.signal.SIGTERM, None)
+        self.assertIn(("exit", 143), self.events)
+
+    def test_ctrl_c_can_be_made_graceful_by_configuration(self):
+        F.STOP_IMMEDIATELY_ON_CTRL_C = False
+        try:
+            F.install_signal_handlers()
+            self.fire(self.signal.SIGINT)
+            self.assertNotIn(("exit", 130), self.events)
+            self.assertIn(("saved", True), self.events)
+            self.assertTrue(F._SHUTDOWN_REQUESTED)
+        finally:
+            F.STOP_IMMEDIATELY_ON_CTRL_C = True
+
+    def test_stop_now_survives_a_missing_saver_and_killer(self):
+        F._CHECKPOINT_SAVER = None
+        F._CLIENT_KILLER = None
+        F.stop_now(7)
+        self.assertIn(("exit", 7), self.events)
+
+    def test_killing_an_unstarted_transport_is_a_no_op(self):
+        from source_file.indeed_client import BrowserTransport
+        transport = BrowserTransport(IndeedClientConfig(
+            browser_visible=True, verbose=False))
+        transport.kill()                             # must not raise
+        self.assertFalse(transport.started)
+        self.assertIsNone(transport.browser)
+
+
 class TestInternetCheck(ErrorTestCase):
 
     def test_the_check_can_be_disabled(self):

@@ -55,6 +55,7 @@ REQUIRED_SETTINGS = [
     "RESPECT_ROBOTS_DISALLOW", "ROBOTS_DISALLOWED_PREFIXES",
     "COOKIE_BANNER_ACTION",
     "LISTING_RENDER_TIMEOUT_MS", "DETAIL_RENDER_TIMEOUT_MS",
+    "STOP_IMMEDIATELY_ON_CTRL_C", "SHOW_JOB_TIMER",
     "BROWSER_REQUIRED", "BROWSER_VISIBLE", "BROWSER_HEADLESS",
     "BROWSER_SLOW_MO_MS", "BROWSER_WIDTH", "BROWSER_HEIGHT",
     "BROWSER_CHANNEL", "BROWSER_NAV_TIMEOUT_MS", "BROWSER_KEEP_OPEN_SECONDS",
@@ -336,6 +337,105 @@ class TestServiceScripts(unittest.TestCase):
             unit = handle.read()
         self.assertIn("KillSignal=SIGTERM", unit)
         self.assertIn("WorkingDirectory=%s" % PROJECT_ROOT, unit)
+
+
+class TestResetScript(unittest.TestCase):
+    """reset.sh must be safe: an allowlist, never a wildcard sweep."""
+
+    RESET = os.path.join(PROJECT_ROOT, "reset.sh")
+
+    def body(self):
+        with open(self.RESET, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_it_exists_and_is_executable(self):
+        self.assertTrue(os.path.isfile(self.RESET))
+        self.assertTrue(os.access(self.RESET, os.X_OK), "./reset.sh must be +x")
+
+    def test_it_is_valid_shell(self):
+        result = subprocess.run(["bash", "-n", self.RESET],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_it_supports_the_documented_flags(self):
+        body = self.body()
+        for flag in ("--dry-run", "--backup", "--yes", "--force", "--help"):
+            self.assertIn(flag, body, flag)
+
+    def test_the_saved_login_and_the_sources_are_protected(self):
+        body = self.body()
+        protected = body[body.index("PROTECTED=("):]
+        protected = protected[:protected.index(")")]
+        for keep in ("indeed_auth.json", "find_indeed_job.py",
+                     "save_indeed_login.py", "new_mylib.py",
+                     "target_audience_roles.py", "source_file",
+                     "tests", "docs", "venv", ".git", "reset.sh"):
+            self.assertIn(keep, protected, keep)
+
+    def test_it_removes_every_runtime_file_the_main_script_writes(self):
+        """Whatever the configuration names, reset.sh must know about it."""
+        body = self.body()
+        for name in (F.CYCLE_STATE_FILE, F.CRAWL_CYCLE_STATE_FILE,
+                     F.CITY_STATE_FILE, F.ROLE_STATE_FILE,
+                     F.FAILED_PAGES_FILE, F.DETAIL_OUTPUT_FILE,
+                     F.MASTER_OUTPUT_FILE):
+            self.assertIn(name, body,
+                          "%s is written by the scraper but reset.sh does "
+                          "not clean it" % name)
+        self.assertIn("current_data_cycle*.xlsx", body, "Excel rotation files")
+
+    def test_it_never_removes_the_saved_login(self):
+        body = self.body()
+        self.assertNotIn("rm -rf indeed_auth", body)
+        self.assertNotIn("rm indeed_auth", body)
+
+    def test_it_refuses_to_run_outside_the_project(self):
+        body = self.body()
+        self.assertIn('if [ ! -f "find_indeed_job.py" ]', body)
+
+    def test_it_has_no_unguarded_recursive_delete(self):
+        """Every rm must act on a collected target, not on a bare glob."""
+        for line in self.body().splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("rm "):
+                continue
+            self.assertIn('"$t"', stripped,
+                          "unexpected rm target: %s" % stripped)
+
+    def test_a_dry_run_changes_nothing(self):
+        before = sorted(os.listdir(PROJECT_ROOT))
+        result = subprocess.run([self.RESET, "--dry-run"],
+                                cwd=PROJECT_ROOT, capture_output=True,
+                                text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("nothing", result.stdout.lower())
+        self.assertEqual(sorted(os.listdir(PROJECT_ROOT)), before,
+                         "a dry run must not touch the project")
+
+    def test_the_help_text_renders(self):
+        result = subprocess.run([self.RESET, "--help"],
+                                cwd=PROJECT_ROOT, capture_output=True,
+                                text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("WHAT IT NEVER TOUCHES", result.stdout)
+        self.assertIn("indeed_auth.json", result.stdout)
+
+    def test_an_unknown_option_is_rejected(self):
+        result = subprocess.run([self.RESET, "--delete-everything"],
+                                cwd=PROJECT_ROOT, capture_output=True,
+                                text=True, timeout=60)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unknown option", result.stderr)
+
+    def test_the_running_check_requires_a_real_python_process(self):
+        """A command line that merely mentions the script is not a run.
+
+        Without this the check refused resets because its own parent shell
+        matched `pgrep -f find_indeed_job.py`.
+        """
+        body = self.body()
+        self.assertIn("*python*find_indeed_job.py*", body)
+        self.assertIn('[ "$candidate" = "$$" ] && continue', body)
 
 
 class TestDocumentation(unittest.TestCase):

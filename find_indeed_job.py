@@ -118,10 +118,10 @@ FIXTURE_JOBS_PER_PAGE = 12
 FIXTURE_SEED = 20261021
 
 # -- Night pause ------------------------------------------------------------
-# 12:00 AM to 6:00 AM IST: the script sleeps instead of collecting.
+# 11:00 PM to 5:00 AM IST: the script sleeps instead of collecting.
 NIGHT_PAUSE_ENABLED = True
-NIGHT_START_HOUR = 0
-NIGHT_END_HOUR = 6
+NIGHT_START_HOUR = 23
+NIGHT_END_HOUR = 5
 
 # -- Keyword configuration --------------------------------------------------
 # The 85 keywords are shuffled ONCE per crawl cycle, within their department,
@@ -132,11 +132,14 @@ KEYWORD_SHUFFLE_ENABLED = True
 # -- Excel configuration ----------------------------------------------------
 # Both files are written directly into this directory.  No output folder.
 DETAIL_OUTPUT_FILE = "current_data.xlsx"
-MASTER_OUTPUT_FILE = "indeed_it_jobs_by_city.xlsx"
+MASTER_OUTPUT_FILE = "indeed_it_jobs_by_city.xlsx" #not important
 EXCEL_BATCH_SIZE = 100          # rows per archived current_data_cycleN.xlsx
 
 # -- Cycle configuration ----------------------------------------------------
-CYCLE_COOLDOWN_MINUTES = 45     # rest between finished crawl cycles
+#MIN AND MAX USED HERE
+#MIN = 10 MIN
+#MAX = 2 HOURS
+CYCLE_COOLDOWN_MINUTES = 45    # rest between finished crawl cycles
 
 # -- Listing configuration --------------------------------------------------
 MAX_LISTING_PAGES = 10          # per (keyword, city) pair
@@ -151,6 +154,7 @@ WORK_PERIOD_MIN_HOURS = 3.7
 WORK_PERIOD_MAX_HOURS = 4.2
 
 # -- Request pacing ---------------------------------------------------------
+#MIN AND MAX
 REQUEST_GAP_SECONDS = 2.0       # polite gap between source requests
 JOB_GAP_SECONDS = 1.0           # between two job detail reads
 CITY_GAP_SECONDS = 5            # between two cities
@@ -251,9 +255,20 @@ BROWSER_LIVE_ACK_ENV = "INDEED_BROWSER_AUTHORISED"
 BROWSER_LIVE_SEARCH_URL_ENV = "INDEED_BROWSER_SEARCH_URL"
 BROWSER_LIVE_DETAIL_URL_ENV = "INDEED_BROWSER_DETAIL_URL"
 
+# -- Stopping the collector -------------------------------------------------
+# True  -> Ctrl+C stops NOW: the checkpoint is written, the browser is killed
+#          and the process ends. No further job is scraped and nothing is
+#          queued for a retry.
+# False -> Ctrl+C behaves like a service stop: finish the job in hand, then
+#          stop at the next safe boundary.
+# A service stop (SIGTERM, i.e. ./indeed stop) always takes the graceful
+# path, so systemd never cuts a job in half.
+STOP_IMMEDIATELY_ON_CTRL_C = True
+
 # -- Logging ----------------------------------------------------------------
 VERBOSE = True
 LOG_EVERY_ROW = True
+SHOW_JOB_TIMER = True           # time each job and the wait before the next
 
 # ===========================================================================
 # END OF CONFIGURATION
@@ -313,7 +328,11 @@ ROLE_CATEGORY = "IT Department"
 
 _SHUTDOWN_REQUESTED = False
 _CHECKPOINT_SAVER = None
-_CLIENT_CLOSER = None       # set in main(): closes the browser on shutdown
+_CLIENT_CLOSER = None       # set in main(): closes the browser gracefully
+_CLIENT_KILLER = None       # set in main(): kills the browser immediately
+
+# Aliased so a test can intercept the process-ending call.
+_exit = os._exit
 
 
 # ===========================================================================
@@ -1528,7 +1547,10 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
 
         already_done = set(state.get("done_job_urls") or [])
 
-        for raw_job in jobs:
+        page_started = time.monotonic()
+        job_times = []
+
+        for job_index, raw_job in enumerate(jobs, start=1):
             job_url = str(raw_job.get("source_url")
                           or raw_job.get("url")
                           or raw_job.get("job_key") or "")
@@ -1579,9 +1601,19 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
                 "source_type": "job_portal",
             }
 
+            job_started = time.monotonic()
             outcome = process_job(client, raw_job, input_row)
+            job_seconds = time.monotonic() - job_started
             if outcome == "saved":
                 saved_here += 1
+
+            if SHOW_JOB_TIMER:
+                job_times.append(job_seconds)
+                average = sum(job_times) / len(job_times)
+                log("      ⏱  job %d/%d %s in %.1fs | avg %.1fs | page "
+                    "elapsed %s"
+                    % (job_index, len(jobs), outcome, job_seconds, average,
+                       human_duration(time.monotonic() - page_started)))
 
             if job_url:
                 already_done.add(job_url)
@@ -1589,9 +1621,18 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
                 # Checkpointed per job: a crash cannot lose or repeat a row.
                 save_crawl_cycle_state(state)
 
-            sleep_jitter(JOB_GAP_SECONDS)
+            # Labelled, so the wait before the next job page is visible
+            # rather than looking like a hang.
+            sleep_jitter(JOB_GAP_SECONDS,
+                         "next job page in" if SHOW_JOB_TIMER else "")
 
         save_master(pd.DataFrame(existing_data.values()))
+
+        if SHOW_JOB_TIMER and jobs:
+            log("     page %d done: %d job(s) in %s (%d saved so far for this "
+                "city)" % (page_number, len(jobs),
+                           human_duration(time.monotonic() - page_started),
+                           saved_here))
 
         if not jobs:
             if page_number > 1:
@@ -1755,31 +1796,78 @@ def run_crawl_cycle(client, state, existing_data) -> str:
 # ORCHESTRATOR
 # ===========================================================================
 
-def install_signal_handlers() -> None:
-    """SIGINT and SIGTERM ask for a graceful stop at the next safe boundary.
+def save_checkpoint_now() -> bool:
+    """Write the crawl checkpoint. True when it was saved."""
+    if not callable(_CHECKPOINT_SAVER):
+        return False
+    try:
+        _CHECKPOINT_SAVER()
+        return True
+    except Exception as error:                       # pragma: no cover
+        log("[STOP] Checkpoint save failed: %s" % error)
+        return False
 
-    ``systemctl stop`` sends SIGTERM, so the service stops with its
-    checkpoint saved rather than losing the page it was on.
+
+def stop_now(exit_code=130) -> None:
+    """Save, kill the browser, and end the process -- immediately.
+
+    This runs inside a signal handler, so it must not wait for anything:
+
+      * the checkpoint is one small atomic JSON write, so it is safe here
+        and means the next run resumes from this exact position;
+      * the browser is KILLED rather than closed, because a polite close
+        needs an idle driver connection and there is a navigation in
+        flight -- that is what produced "Connection closed while reading
+        from the driver" in the log before this existed;
+      * ``os._exit`` ends the process without unwinding, so no library can
+        swallow the exit, no traceback is printed, no further job is
+        scraped and nothing is queued for a retry.
+    """
+    saved = save_checkpoint_now()
+    if callable(_CLIENT_KILLER):
+        try:
+            _CLIENT_KILLER()
+        except Exception:
+            pass
+    log("[STOP] Stopped. Checkpoint %s -- re-run to continue from here."
+        % ("saved" if saved else "unchanged"))
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    _exit(int(exit_code))
+
+
+def install_signal_handlers() -> None:
+    """Ctrl+C stops immediately; a service stop (SIGTERM) stops gracefully.
+
+    The first thing the handler does is disarm BOTH signals, so pressing
+    Ctrl+C again cannot re-enter it and print a second message -- a repeated
+    Ctrl+C is simply ignored while the stop completes.
     """
     def handler(signum, _frame):
         global _SHUTDOWN_REQUESTED
-        if _SHUTDOWN_REQUESTED:
-            log("\n[STOP] Second signal (%s) -- closing the browser and "
-                "exiting now." % signum)
-            if callable(_CLIENT_CLOSER):
-                try:
-                    _CLIENT_CLOSER()
-                except Exception:
-                    pass
-            raise SystemExit(1)
-        _SHUTDOWN_REQUESTED = True
-        log("\n[STOP] Signal %s received -- saving the checkpoint and "
-            "stopping at the next safe point." % signum)
-        if callable(_CHECKPOINT_SAVER):
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                _CHECKPOINT_SAVER()
-            except Exception as error:               # pragma: no cover
-                log("[STOP] Checkpoint save failed: %s" % error)
+                signal.signal(sig, signal.SIG_IGN)
+            except (ValueError, OSError):            # pragma: no cover
+                pass
+
+        already_asked = _SHUTDOWN_REQUESTED
+        _SHUTDOWN_REQUESTED = True
+
+        interrupt = signum == getattr(signal, "SIGINT", None)
+        if already_asked or (interrupt and STOP_IMMEDIATELY_ON_CTRL_C):
+            print("", flush=True)                    # close off the "^C" line
+            stop_now(130 if interrupt else 143)
+            return                                   # unreachable
+
+        # The graceful path: a service stop finishes the job in hand.
+        log("\n[STOP] Signal %s received -- finishing this job, saving the "
+            "checkpoint and stopping." % signum)
+        save_checkpoint_now()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -1871,7 +1959,7 @@ def load_existing_master_map() -> dict:
 
 def main(max_cycles=None, client=None) -> int:
     """Run crawl cycles until stopped, or ``max_cycles`` cycles for a test."""
-    global _CHECKPOINT_SAVER, _CLIENT_CLOSER
+    global _CHECKPOINT_SAVER, _CLIENT_CLOSER, _CLIENT_KILLER
 
     install_signal_handlers()
 
@@ -1879,6 +1967,7 @@ def main(max_cycles=None, client=None) -> int:
     plan_pairs = keyword_plan_pairs()
     client = client or build_client()
     _CLIENT_CLOSER = client.cleanup
+    _CLIENT_KILLER = client.kill
     print_startup_banner(cities_now, plan_pairs, client)
 
     reset_work_timer()
