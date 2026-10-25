@@ -197,6 +197,84 @@ page, so any future slowdown is visible immediately rather than guessed at.
 
 ---
 
+## 6a. Only two listing pages per city (25 October)
+
+### The symptom
+
+> "why it takes jobs only 2 listening pages after 2 pages it change the city"
+
+### The cause
+
+The number of pages crawled for a (keyword, city) pair came **entirely from
+the job count in the site's own results header**:
+
+```
+"16 jobs" / RESULTS_PER_PAGE (10)  =  2 pages, then move to the next city
+```
+
+That header under-reports for a narrow search — the site will happily serve
+pages 3, 4 and 5 for a search it summarises as "16 jobs" — so pages that
+genuinely existed were never opened. Two smaller faults sat alongside it:
+
+* the header text was parsed with "first number wins", so a header reading
+  `Page 1 of 1,234 jobs` was read as **1** and planned a single page;
+* a header of 0 meant "stop", even when the page in front of it was full of
+  job cards.
+
+### The fix: a floor and a cap, with honest early stops
+
+```python
+MIN_LISTING_PAGES = 4           # floor: do not believe a small header count
+MAX_LISTING_PAGES = 10          # ceiling, per (keyword, city) pair
+RESULTS_PER_PAGE  = 10          # the site paginates in steps of 10
+STOP_ON_PAGE_WITH_NO_NEW_JOBS = True
+```
+
+`page_count()` now takes a `minimum` as well as a `cap`. The cap still wins,
+so politeness is never loosened by the floor:
+
+| Header says | Planned before | Planned now |
+|-------------|----------------|-------------|
+| 16 jobs | 2 pages | **4 pages** |
+| 45 jobs | 5 pages | 5 pages |
+| 150 jobs | 10 pages | 10 pages |
+| 0 jobs, cards on the page | stop | crawl the floor |
+
+A floor would be wasteful on its own, so pagination now stops the moment the
+results actually run out, by either of two signals:
+
+1. **an empty page** — stop immediately;
+2. **a page whose every job this combo has already collected** — the site
+   repeats cards when it runs out of real results, so "nothing new on this
+   page" is the end of the results, and a more reliable signal than the
+   header count.
+
+The header parser now takes the **largest** number in the text, so
+`Page 1 of 1,234 jobs` reads as 1,234.
+
+### Measured against a stub that mimics the real behaviour
+
+| Scenario | Pages requested | Rows |
+|----------|-----------------|------|
+| 5 real pages, header says 16 | 1, 2, 3, 4 (was 1, 2) | 12 (was 6) |
+| 1 real page, header says 16 | 1, 2 — the floor costs **one** wasted request | 3 |
+| 10 pages promised, results end at 2 | 1, 2, 3 — **7 requests saved** | 6 |
+| Genuinely empty search | 1 | 0 |
+| Rich search | 1…10 (the cap) | 30 |
+
+That last row matters for the 429 you hit: the old code would have spent all
+ten requests whenever the header promised them, whether or not there was
+anything left to collect. Stopping on the first repeat page spends fewer
+requests on exhausted searches while collecting more from the deep ones.
+
+Tuning: raise `MIN_LISTING_PAGES` to dig deeper into small-city results
+(each extra page costs one request per city only until the results run out);
+raise `MAX_LISTING_PAGES` to go deeper into big-city results. 13 tests in
+`tests/test_indeed_client.py` (`TestPagePlanning`, `TestResultHeaderParsing`,
+`TestPaginationStops`) hold all of this in place.
+
+---
+
 ## 7. Two unrelated defects found while measuring
 
 **`BrowserTransport.kill()` was too broad.** The immediate-stop path (Ctrl+C)

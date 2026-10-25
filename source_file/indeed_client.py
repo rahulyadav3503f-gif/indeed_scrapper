@@ -138,6 +138,7 @@ class IndeedClientConfig:
         language="en",
         results_per_page=20,
         max_listing_pages=10,
+        min_listing_pages=1,
         request_timeout_seconds=30,
         connect_timeout_seconds=10,
         max_retries_5xx=4,
@@ -191,6 +192,7 @@ class IndeedClientConfig:
         self.language = language
         self.results_per_page = int(results_per_page)
         self.max_listing_pages = int(max_listing_pages)
+        self.min_listing_pages = max(1, int(min_listing_pages))
         self.request_timeout_seconds = float(request_timeout_seconds)
         self.connect_timeout_seconds = float(connect_timeout_seconds)
         self.max_retries_5xx = int(max_retries_5xx)
@@ -1574,15 +1576,18 @@ class BrowserTransport(BaseTransport):
         """
         text = getattr(self, "_last_total_text", "")
         if text:
-            match = re.search(r"([\d,]{1,12})", text.replace(" ", ""))
-            if match:
-                return int(match.group(1).replace(",", ""))
+            parsed = _largest_number(text)
+            if parsed is not None:
+                return parsed
 
         for selector in self._TOTAL_SELECTORS:
             try:
                 if page.locator(selector).count():
                     text = page.locator(selector).first.inner_text()
                     match = re.search(r"([\d,]{1,12})", text.replace(" ", ""))
+                    parsed = _largest_number(text)
+                    if parsed is not None:
+                        return parsed
                     if match:
                         return int(match.group(1).replace(",", ""))
             except Exception:
@@ -2231,6 +2236,24 @@ def _job_from_json_ld(node, is_demo):
     return raw
 
 
+def _largest_number(text):
+    """The largest number in a results header, or None.
+
+    The header is not always just a count: "Page 1 of 1,234 jobs" reads
+    first as 1, which would plan a single page for a search with 124 of
+    them. The result count is the biggest number present, so that is the
+    one taken.
+    """
+    found = re.findall(r"\d[\d,]{0,11}", str(text or ""))
+    numbers = []
+    for raw in found:
+        try:
+            numbers.append(int(raw.replace(",", "")))
+        except ValueError:
+            continue
+    return max(numbers) if numbers else None
+
+
 def _hash_key(seed):
     return "b%s" % hashlib.sha1(str(seed).encode("utf-8")).hexdigest()[:11]
 
@@ -2416,13 +2439,35 @@ class IndeedClient:
         self._distinct_denied_urls.clear()
         return [job for job in jobs if isinstance(job, dict)], total
 
-    def page_count(self, total_jobs, per_page=None, cap=None) -> int:
-        """Pages to crawl for a result count, capped by configuration."""
+    def page_count(self, total_jobs, per_page=None, cap=None,
+                   minimum=None) -> int:
+        """How many listing pages to plan for a reported result count.
+
+        ``minimum`` is a FLOOR on the plan, and it exists because the site's
+        own header count cannot be trusted downwards: a narrow search that
+        really has five pages of results often advertises "16 jobs", which
+        divided by the page size said two pages and sent the crawl to the
+        next city early.
+
+        A floor costs at most one wasted request per city, because the
+        caller stops the moment a page comes back empty or brings nothing
+        new. ``cap`` still wins over ``minimum`` -- the politeness ceiling
+        is never raised by it.
+
+        ``total_jobs <= 0`` still plans nothing when NO cards were seen;
+        deciding "the header said zero but there are cards on the page" is
+        the caller's job, since only it can see the cards.
+        """
         per_page = int(per_page or self.config.results_per_page or 1)
         cap = int(cap if cap is not None else self.config.max_listing_pages)
+        floor = int(minimum if minimum is not None
+                    else self.config.min_listing_pages)
+
         if total_jobs <= 0:
             return 0
+
         pages = (int(total_jobs) + per_page - 1) // per_page
+        pages = max(pages, max(1, floor))
         return max(1, min(pages, cap)) if cap > 0 else max(1, pages)
 
     def iter_listings(self, keyword, city, start_page=1, max_pages=None):

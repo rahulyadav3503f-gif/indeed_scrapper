@@ -11,8 +11,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+import find_indeed_job as F                        # noqa: E402
 from source_file.indeed_client import (            # noqa: E402
     FixtureTransport,
+    _largest_number,
     IndeedAccessDenied,
     IndeedClient,
     IndeedClientConfig,
@@ -345,6 +347,173 @@ class TestLiveModeGuards(unittest.TestCase):
         config = F_BUILD_CONFIG()
         self.assertTrue(config.respect_robots_disallow)
         self.assertTrue(config.robots_disallowed_prefixes)
+
+
+
+
+class TestPagePlanning(unittest.TestCase):
+    """How many listing pages one (keyword, city) pair is worth.
+
+    The count in the site's results header cannot be trusted downwards: a
+    narrow search that really has five pages often advertises "16 jobs",
+    which divided by the page size said two pages and sent the crawl on to
+    the next city. MIN_LISTING_PAGES is the floor that fixes that; the cap
+    still wins over it.
+    """
+
+    def client(self, **overrides):
+        settings = dict(verbose=False, request_gap_seconds=0,
+                        results_per_page=10, min_listing_pages=4,
+                        max_listing_pages=10)
+        settings.update(overrides)
+        return IndeedClient(IndeedClientConfig(**settings))
+
+    def test_a_small_header_count_is_lifted_to_the_floor(self):
+        client = self.client()
+        for reported in (1, 5, 8, 16, 30, 40):
+            self.assertEqual(client.page_count(reported), 4,
+                             "header %d" % reported)
+
+    def test_a_large_header_count_is_used_as_is(self):
+        client = self.client()
+        self.assertEqual(client.page_count(45), 5)
+        self.assertEqual(client.page_count(70), 7)
+
+    def test_the_cap_always_wins_over_the_floor(self):
+        client = self.client(min_listing_pages=20, max_listing_pages=3)
+        self.assertEqual(client.page_count(10_000), 3)
+        self.assertEqual(client.page_count(1), 3)
+
+    def test_no_cards_still_plans_nothing(self):
+        client = self.client()
+        self.assertEqual(client.page_count(0), 0)
+        self.assertEqual(client.page_count(-5), 0)
+
+    def test_the_floor_defaults_to_one_so_the_carrier_is_safe(self):
+        config = IndeedClientConfig(verbose=False)
+        self.assertEqual(config.min_listing_pages, 1)
+
+    def test_the_floor_is_never_below_one(self):
+        config = IndeedClientConfig(verbose=False, min_listing_pages=0)
+        self.assertEqual(config.min_listing_pages, 1)
+
+    def test_an_explicit_minimum_overrides_the_configured_one(self):
+        client = self.client(min_listing_pages=4)
+        self.assertEqual(client.page_count(1, minimum=1), 1)
+        self.assertEqual(client.page_count(1, minimum=7), 7)
+
+
+class TestResultHeaderParsing(unittest.TestCase):
+    """The result count is the biggest number in the header, not the first."""
+
+    def test_a_plain_count(self):
+        self.assertEqual(_largest_number("16 jobs"), 16)
+
+    def test_a_page_prefix_does_not_win(self):
+        self.assertEqual(_largest_number("Page 1 of 16 jobs"), 16)
+        self.assertEqual(_largest_number("Page 2 of 1,234 jobs"), 1234)
+
+    def test_thousands_separators(self):
+        self.assertEqual(_largest_number("1,234 jobs"), 1234)
+        self.assertEqual(_largest_number("12,345 jobs"), 12345)
+
+    def test_no_number_at_all(self):
+        self.assertIsNone(_largest_number("no numbers here"))
+        self.assertIsNone(_largest_number(""))
+        self.assertIsNone(_largest_number(None))
+
+
+class TestPaginationStops(unittest.TestCase):
+    """The floor must not cost requests on a city that has one real page."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="indeed-pages-")
+        self._saved = {name: getattr(F, name) for name in
+                       ("BASE_DIR", "VERBOSE", "REQUEST_GAP_SECONDS",
+                        "JOB_GAP_SECONDS", "NIGHT_PAUSE_ENABLED",
+                        "LOG_EVERY_ROW", "SHOW_JOB_TIMER")}
+        F.BASE_DIR = self.tmp
+        F.VERBOSE = False
+        F.REQUEST_GAP_SECONDS = 0
+        F.JOB_GAP_SECONDS = 0
+        F.NIGHT_PAUSE_ENABLED = False
+        F.LOG_EVERY_ROW = False
+        F.SHOW_JOB_TIMER = False
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            setattr(F, name, value)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def crawl(self, transport):
+        client = IndeedClient(
+            IndeedClientConfig(verbose=False, request_gap_seconds=0,
+                               results_per_page=F.RESULTS_PER_PAGE,
+                               min_listing_pages=F.MIN_LISTING_PAGES,
+                               max_listing_pages=F.MAX_LISTING_PAGES),
+            transport=transport)
+        state = F.load_or_open_crawl_cycle(
+            ["Pune"], [("IT Department", "Network Engineer")])
+        state["current_page"] = 1
+        saved = F.run_combo(client, state, "IT Department",
+                            "Network Engineer", "Pune", {})
+        return saved, transport.asked
+
+    @staticmethod
+    def pages_transport(real_pages, header, repeat_after=None):
+        class Pages(FixtureTransport):
+            def __init__(self):
+                super().__init__()
+                self.asked = []
+
+            def search(self, keyword, city, page, config):
+                self.asked.append(page)
+                if page > real_pages:
+                    return {"jobs": [], "total": header}
+                shown = min(page, repeat_after) if repeat_after else page
+                jobs = [{"job_key": "p%dj%d" % (shown, i),
+                         "title": "Network Engineer",
+                         "company_name": "Acme Ltd",
+                         "description": "d" * 200,
+                         "source_url": "https://x.invalid/p%dj%d" % (shown, i)}
+                        for i in range(3)]
+                return {"jobs": jobs, "total": header}
+        return Pages()
+
+    def test_an_under_reporting_header_no_longer_stops_at_two_pages(self):
+        """16 jobs / 10 per page used to mean two pages and a new city."""
+        saved, asked = self.crawl(self.pages_transport(5, header=16))
+        self.assertEqual(asked, [1, 2, 3, 4], "the floor must be crawled")
+        self.assertEqual(saved, 12)
+
+    def test_an_empty_page_stops_it_at_once(self):
+        saved, asked = self.crawl(self.pages_transport(1, header=16))
+        self.assertEqual(asked, [1, 2],
+                         "the floor costs ONE wasted request, not three")
+        self.assertEqual(saved, 3)
+
+    def test_a_page_that_repeats_earlier_jobs_stops_it(self):
+        """A header promising ten pages must not cost ten requests."""
+        saved, asked = self.crawl(
+            self.pages_transport(10, header=500, repeat_after=2))
+        self.assertEqual(asked, [1, 2, 3])
+        self.assertEqual(saved, 6)
+
+    def test_a_rich_search_is_crawled_up_to_the_cap(self):
+        saved, asked = self.crawl(self.pages_transport(50, header=5000))
+        self.assertEqual(asked, list(range(1, F.MAX_LISTING_PAGES + 1)))
+        self.assertEqual(saved, 3 * F.MAX_LISTING_PAGES)
+
+    def test_cards_are_trusted_over_a_zero_header(self):
+        saved, asked = self.crawl(self.pages_transport(2, header=0))
+        self.assertGreaterEqual(len(asked), 2,
+                                "a wrong header must not skip a real page")
+        self.assertEqual(saved, 6)
+
+    def test_a_genuinely_empty_search_costs_one_request(self):
+        saved, asked = self.crawl(self.pages_transport(0, header=0))
+        self.assertEqual(asked, [1])
+        self.assertEqual(saved, 0)
 
 
 if __name__ == "__main__":

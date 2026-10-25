@@ -142,8 +142,32 @@ EXCEL_BATCH_SIZE = 100          # rows per archived current_data_cycleN.xlsx
 CYCLE_COOLDOWN_MINUTES = 45    # rest between finished crawl cycles
 
 # -- Listing configuration --------------------------------------------------
-MAX_LISTING_PAGES = 10          # per (keyword, city) pair
-RESULTS_PER_PAGE = 10           # results per listing page (= INDEED_PAGE_STEP)
+# HOW MANY LISTING PAGES ARE CRAWLED FOR ONE (keyword, city) PAIR
+#
+# The site states a job count in its results header ("16 jobs"), and the
+# number of pages used to be taken from that count alone:
+#
+#     16 jobs / 10 per page = 2 pages, then move to the next city
+#
+# That header under-reports for a narrow search, so pages that genuinely
+# exist were never opened. The two settings below bound it from both ends:
+#
+#   MIN_LISTING_PAGES  always try at least this many pages, whatever the
+#                      header claims. Pagination still stops early the
+#                      moment a page comes back empty or repeats jobs
+#                      already collected -- so a city with only one real
+#                      page costs one wasted request, not MIN of them.
+#   MAX_LISTING_PAGES  never open more than this many, however many the
+#                      header promises. This is the politeness ceiling.
+MIN_LISTING_PAGES = 4           # floor: do not believe a small header count
+MAX_LISTING_PAGES = 30          # ceiling, per (keyword, city) pair
+RESULTS_PER_PAGE = 16           # results per listing page (= INDEED_PAGE_STEP)
+
+# Stop paginating when a page adds no job this combo has not already seen.
+# The site repeats cards across pages once it runs out of real results, so
+# "a page with nothing new on it" is the honest end-of-results signal --
+# more reliable than the header count.
+STOP_ON_PAGE_WITH_NO_NEW_JOBS = True
 
 # -- Periodic breaks --------------------------------------------------------
 # After WORK_PERIOD hours of ACTUAL WORKING time (night stops, breaks,
@@ -1392,6 +1416,7 @@ def build_client_config(verbose=None) -> IndeedClientConfig:
         detail_path=os.environ.get(SOURCE_DETAIL_PATH_ENV, ""),
         results_per_page=RESULTS_PER_PAGE,
         max_listing_pages=MAX_LISTING_PAGES,
+        min_listing_pages=MIN_LISTING_PAGES,
         request_timeout_seconds=HTTP_READ_TIMEOUT_SECONDS,
         connect_timeout_seconds=HTTP_CONNECT_TIMEOUT_SECONDS,
         max_retries_5xx=MAX_RETRIES_5XX,
@@ -1533,6 +1558,12 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
     page_number = max(1, int(state.get("current_page", 1)))
     total = None
     saved_here = 0
+    pages_planned = None
+    # Every job key this combo has seen, across all of its pages. The site
+    # repeats cards once it runs out of real results, so "this page brought
+    # nothing new" is the end of the results -- a more honest signal than
+    # the header count, which under-reports.
+    seen_in_combo = set()
 
     while page_number <= MAX_LISTING_PAGES:
         pacing_gate()
@@ -1568,14 +1599,34 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
                 % (page_number, type(error).__name__))
             break
 
-        if page_number == 1:
-            pages = client.page_count(total, cap=MAX_LISTING_PAGES)
-            log("     %s job(s) reported -> %d page(s) to crawl (cap %d)"
-                % ("{:,}".format(total), pages, MAX_LISTING_PAGES))
-            if total == 0:
+        if pages_planned is None:
+            pages_planned = client.page_count(
+                total, cap=MAX_LISTING_PAGES, minimum=MIN_LISTING_PAGES)
+            if total == 0 and jobs:
+                # The header said nothing but the page is full of cards, so
+                # the header is wrong, not the search. Crawl the floor and
+                # let the early-stop rule below decide where to stop.
+                pages_planned = max(1, min(MIN_LISTING_PAGES,
+                                           MAX_LISTING_PAGES))
+                log("     header reported 0 jobs but the page has %d card(s)"
+                    " -- crawling up to %d page(s) and stopping when a page "
+                    "brings nothing new" % (len(jobs), pages_planned))
+            else:
+                log("     %s job(s) reported -> %d page(s) to crawl "
+                    "(floor %d, cap %d)"
+                    % ("{:,}".format(total), pages_planned,
+                       MIN_LISTING_PAGES, MAX_LISTING_PAGES))
+            if total == 0 and not jobs:
                 break
 
-        log("     page %d: %d listing(s)" % (page_number, len(jobs)))
+        page_keys = {str(job.get("job_key") or job.get("source_url") or "")
+                     for job in jobs}
+        page_keys.discard("")
+        new_keys = page_keys - seen_in_combo
+        seen_in_combo |= page_keys
+
+        log("     page %d: %d listing(s) (%d new)"
+            % (page_number, len(jobs), len(new_keys)))
 
         already_done = set(state.get("done_job_urls") or [])
 
@@ -1678,8 +1729,15 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
         save_crawl_cycle_state(state)
         save_city_state(city, page_number)
 
-        if total is not None and page_number > client.page_count(
-                total, cap=MAX_LISTING_PAGES):
+        if STOP_ON_PAGE_WITH_NO_NEW_JOBS and jobs and not new_keys:
+            log("     every job on page %d was already collected for this "
+                "city -- end of results, moving on" % (page_number - 1))
+            state["current_page"] = 1
+            state["done_job_urls"] = []
+            save_crawl_cycle_state(state)
+            return saved_here
+
+        if pages_planned is not None and page_number > pages_planned:
             break
 
     state["current_page"] = 1
