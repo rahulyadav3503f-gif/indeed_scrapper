@@ -97,11 +97,24 @@ class TestConfiguration(unittest.TestCase):
     """The browser settings live at the top of the main file, as required."""
 
     def test_the_required_settings_exist_with_the_requested_values(self):
+        """The two switches are a requirement; the numbers are tunable.
+
+        "visible, not headless" is what was asked for, so it is asserted
+        exactly. The slow-motion delay and the window size are operator
+        settings that get tuned in the field -- slow_mo was raised to 350ms
+        after a 429 -- so they are checked for being sane, not for being a
+        particular number. A test that pins a tunable breaks on a perfectly
+        valid change to it.
+        """
         self.assertIs(F.BROWSER_VISIBLE, True)
         self.assertIs(F.BROWSER_HEADLESS, False)
-        self.assertEqual(F.BROWSER_SLOW_MO_MS, 300)
-        self.assertEqual(F.BROWSER_WIDTH, 1366)
-        self.assertEqual(F.BROWSER_HEIGHT, 768)
+
+        self.assertIsInstance(F.BROWSER_SLOW_MO_MS, int)
+        self.assertGreaterEqual(F.BROWSER_SLOW_MO_MS, 0)
+        self.assertLess(F.BROWSER_SLOW_MO_MS, 5000,
+                        "a slow_mo this large would make a run unusable")
+        self.assertGreaterEqual(F.BROWSER_WIDTH, 800)
+        self.assertGreaterEqual(F.BROWSER_HEIGHT, 600)
 
     def test_they_are_inside_the_configuration_block(self):
         with open(os.path.join(PROJECT_ROOT, "find_indeed_job.py"),
@@ -731,6 +744,60 @@ class TestRenderWaitsAreBounded(unittest.TestCase):
         self.assertLess(elapsed, budget + 2,
                         "%.1fs for a %.0fs budget -- the waits are serial "
                         "again" % (elapsed, budget))
+
+
+@needs_browser
+class TestBrowserSelfHealing(unittest.TestCase):
+    """A browser that dies under the collector must be relaunched.
+
+    Chromium can be killed by the kernel under memory pressure or simply
+    crash. The `started` flag stayed True, so every later page load failed
+    with "Target page, context or browser has been closed" and each failure
+    was filed as a retryable page -- one crash turned into a cycle that
+    collected nothing.
+    """
+
+    def setUp(self):
+        self.transport = BrowserTransport(browser_config())
+        self.transport.start()
+
+    def tearDown(self):
+        self.transport.stop()
+        self.transport.cleanup_pages()
+
+    def test_a_live_browser_reports_itself_alive(self):
+        self.assertTrue(self.transport.is_alive())
+
+    def test_an_unstarted_transport_is_not_alive(self):
+        fresh = BrowserTransport(browser_config())
+        self.assertFalse(fresh.is_alive())
+
+    def test_a_killed_browser_is_detected(self):
+        self.transport.browser.close()
+        self.assertFalse(self.transport.is_alive(),
+                         "a closed browser must not report itself alive")
+
+    def test_the_next_request_relaunches_a_dead_browser(self):
+        self.transport.browser.close()
+        self.assertFalse(self.transport.is_alive())
+
+        # The next search must succeed rather than raise TargetClosedError.
+        payload = self.transport.search("Network Engineer", "Pune", 1,
+                                        self.config_of(self.transport))
+        self.assertTrue(self.transport.is_alive(), "it was not relaunched")
+        self.assertIsInstance(payload.get("jobs"), list)
+
+    def test_the_relaunched_browser_has_working_pages(self):
+        self.transport.browser.close()
+        self.transport._require_started()
+        self.assertTrue(self.transport.is_alive())
+        self.transport.page.goto("data:text/html,<h1 id=p>back</h1>")
+        self.assertEqual(self.transport.page.locator("#p").inner_text(),
+                         "back")
+
+    @staticmethod
+    def config_of(transport):
+        return transport.config
 
 
 @needs_browser

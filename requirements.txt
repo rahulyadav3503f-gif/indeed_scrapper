@@ -7,9 +7,12 @@
 #   requests           the live HTTP transport (only used when an authorised
 #                      source is configured; the offline fixture mode needs
 #                      nothing but the standard library)
-#   Levenshtein        fuzzy city -> state matching.  OPTIONAL: new_mylib.py
-#                      falls back to a pure-Python implementation when it is
-#                      not installed.
+#   Levenshtein        fuzzy city -> state matching, imported by new_mylib.py
+#   gtts / psutil      imported at module level by new_mylib.py, which is the
+#                      file SHARED with the Naukri project (see
+#                      docs/SHARED_LIBRARY.md). The collector never calls the
+#                      text-to-speech or battery helpers that need them, but
+#                      the import fails without them.
 #
 # The tests run on the standard library's unittest; pytest is not required.
 pandas>=1.5
@@ -17,3 +20,5 @@ openpyxl>=3.0
 playwright>=1.40
 requests>=2.25
 Levenshtein>=0.20 ; python_version >= "3.8"
+gtts>=2.5
+psutil>=5.9

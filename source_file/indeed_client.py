@@ -1362,7 +1362,36 @@ class BrowserTransport(BaseTransport):
 
     # -- navigation ---------------------------------------------------------
 
+    def is_alive(self) -> bool:
+        """True when the browser is up and still answering."""
+        if not self.started or self.browser is None:
+            return False
+        try:
+            return bool(self.browser.is_connected())
+        except Exception:
+            return False
+
     def _require_started(self):
+        """Make sure there is a LIVE browser before using it.
+
+        Checking ``self.started`` alone was not enough. Chromium can die
+        under the collector -- the machine runs out of memory, the browser
+        crashes, something kills the process -- and the flag stays True, so
+        every page load afterwards failed with "Target page, context or
+        browser has been closed". Each failure was recorded as a retryable
+        page and the run carried on, so a single crash quietly turned into a
+        cycle that collected nothing.
+
+        A dead browser is now torn down and relaunched once, here, at the
+        start of the next request.
+        """
+        if self.started and not self.is_alive():
+            _log(self.config, "   [BROWSER] the browser is gone (crashed or "
+                              "was killed) -- relaunching it")
+            try:
+                self.stop()
+            except Exception:
+                pass
         if not self.started:
             self.start()
 

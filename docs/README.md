@@ -47,8 +47,8 @@ periodic breaks.
 │   ├── indeed_client.py      the browser + the data source
 │   ├── indeed_extractor.py   builds the 32-column row
 │   └── indeed_apply_url.py   finds the real application url
-├── new_mylib.py              the 110 crawl cities + city → state lookup
-├── target_audience_roles.py  the 85 keywords + the non-IT filter
+├── new_mylib.py              cities + city → state  (SHARED with Naukri)
+├── target_audience_roles.py  the 85 keywords + non-IT filter (SHARED)
 ├── requirements.txt
 ├── .gitignore
 ├── indeed                    ./indeed start|stop|restart|status|log
@@ -424,7 +424,8 @@ python3 -m unittest discover -s tests -p "test_*.py" -v
 No pytest needed — the suite is standard-library `unittest`. See
 `docs/TEST_REPORT.md` for what is covered and the latest run, and
 `docs/PERFORMANCE_FIXES.md` for why a job used to take one to two minutes and
-what was changed to make it seconds.
+what was changed to make it seconds, and `docs/SHARED_LIBRARY.md` for the two
+files this project now shares byte-for-byte with the Naukri scraper.
 
 ---
 

@@ -304,10 +304,33 @@ from source_file.indeed_extractor import (                             # noqa: E
 from new_mylib import city_by_states, city_to_state, job_by_department  # noqa: E402
 
 try:
-    from target_audience_roles import is_non_it_title, role_plan_split
+    from target_audience_roles import (                                # noqa: E402
+        build_role_plan,
+        is_non_it_title,
+        role_plan_split,
+    )
 except ImportError:                                 # pragma: no cover
+    build_role_plan = None
     is_non_it_title = None
     role_plan_split = None
+
+# ---------------------------------------------------------------------------
+# THE CRAWL PLAN IS NARROWED TO THE TARGET AUDIENCE
+# ---------------------------------------------------------------------------
+# new_mylib.py is the SHARED library: it is the same file as the Naukri
+# project's, byte for byte, so the two scrapers cannot drift apart. That file
+# carries a 432-entry "IT Department" list, and the reference scraper narrows
+# it to the 85-role target plan in its OWN main script
+# (find_naukri_job.py:1147):
+#
+#     job_by_department = {"IT Department": build_role_plan()}
+#
+# The same line has to live here, for the same reason. Without it this
+# collector would crawl 407 keywords x 23 cities = 9,361 combos per cycle
+# instead of 85 x 23 = 1,955, and would ask for the roles the 80/20 plan
+# exists to exclude.
+if build_role_plan is not None:
+    job_by_department = {"IT Department": build_role_plan()}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -331,7 +354,9 @@ MASTER_COLUMNS = [
 ]
 
 CRAWL_CYCLE_SCHEMA_VERSION = 1
-ROLE_CATEGORY = "IT Department"
+# Derived from the plan above, so the two can never disagree about the
+# department name.
+ROLE_CATEGORY = next(iter(job_by_department), "IT Department")
 
 _SHUTDOWN_REQUESTED = False
 _CHECKPOINT_SAVER = None

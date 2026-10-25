@@ -9,7 +9,19 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import find_indeed_job as F                        # noqa: E402
-from new_mylib import all_crawl_cities, city_by_states, city_to_state  # noqa: E402
+from new_mylib import city_by_states, city_to_state  # noqa: E402
+
+
+def all_crawl_cities():
+    """The crawl city list, flattened and de-duplicated, order preserved.
+
+    new_mylib.py is now the SHARED library -- byte-identical to the Naukri
+    project's copy -- so it carries no Indeed-only helpers. The flattening
+    lives in the main script (``F.all_cities``); this mirrors it so the
+    tests below can state the city contract independently of it.
+    """
+    cities = [city for group in city_by_states.values() for city in group]
+    return list(dict.fromkeys(cities))
 
 
 class TestCityList(unittest.TestCase):
@@ -23,6 +35,7 @@ class TestCityList(unittest.TestCase):
             self.assertIn(expected, cities)
 
     def test_the_main_script_sees_the_same_list(self):
+        """The main script's flattener must agree with the shared table."""
         self.assertEqual(F.all_cities(), all_crawl_cities())
 
     def test_order_is_stable_between_calls(self):

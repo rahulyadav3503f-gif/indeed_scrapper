@@ -1,18 +1,4 @@
-"""Target-audience role plan for the independent Indeed job scraper.
-
-INDEPENDENT COPY
-----------------
-This file is a copy of the role plan proven in the Naukri reference project,
-kept inside the Indeed project so that nothing is imported from it at
-runtime.  The role data and the non-IT filter are deliberately identical --
-both portals serve the same audience, and the two scrapers must not disagree
-about which jobs belong in the database.
-
-68 target-audience roles + 17 other high-demand Indian IT roles = 85 search
-keywords.  ``role_plan_split()`` asserts that split for the startup banner.
-
-ORIGINAL NOTES
---------------
+"""Target-audience role plan shared by every job fetching script.
 
 WHY THIS FILE EXISTS
 --------------------
