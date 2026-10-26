@@ -514,6 +514,43 @@ class TestImmediateStopOnCtrlC(ErrorTestCase):
         self.assertFalse(transport.started)
         self.assertIsNone(transport.browser)
 
+    def test_a_browser_can_be_opened_again_after_a_kill(self):
+        """A kill must not make the process unable to open another browser.
+
+        Killing the driver leaves Playwright's thread-local event loop
+        behind, and the next sync_playwright().start() then fails with "you
+        are using Playwright Sync API inside the asyncio loop". Measured
+        before the fix: the relaunch failed; after it, it works.
+        """
+        import shutil as shutil_module
+        if not shutil_module.which("Xvfb") and not os.environ.get("DISPLAY"):
+            self.skipTest("needs a display or Xvfb")
+        try:
+            import playwright                        # noqa: F401
+        except ImportError:
+            self.skipTest("needs Playwright")
+
+        from source_file.indeed_client import BrowserTransport
+
+        def config():
+            return IndeedClientConfig(live_enabled=False,
+                                      browser_visible=True,
+                                      browser_headless=True,
+                                      request_gap_seconds=0, verbose=False)
+
+        first = BrowserTransport(config())
+        first.start()
+        first.kill()
+
+        second = BrowserTransport(config())
+        try:
+            second.start()
+            self.assertTrue(second.browser.is_connected(),
+                            "the process could not open a browser after a kill")
+        finally:
+            second.stop()
+            second.cleanup_pages()
+
     def test_kill_only_touches_the_driver_it_launched(self):
         """It must not sweep up unrelated child processes.
 

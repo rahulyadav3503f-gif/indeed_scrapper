@@ -19,6 +19,7 @@ if PROJECT_ROOT not in sys.path:
 import find_indeed_job as F                        # noqa: E402
 from source_file.indeed_client import (            # noqa: E402
     BrowserTransport,
+    VirtualDisplay,
     BrowserUnavailable,
     DemoPageBuilder,
     IndeedAccessDenied,
@@ -746,6 +747,225 @@ class TestRenderWaitsAreBounded(unittest.TestCase):
                         "again" % (elapsed, budget))
 
 
+class TestVirtualDisplayConfiguration(unittest.TestCase):
+    """The Xvfb settings live at the top of the main file, like the rest."""
+
+    def test_the_settings_exist_and_are_sane(self):
+        self.assertIn(F.XVFB_MODE, ("auto", "always", "never"))
+        self.assertIsInstance(F.XVFB_DISPLAY, str)
+        self.assertGreaterEqual(F.XVFB_COLOUR_DEPTH, 8)
+
+    def test_they_are_inside_the_configuration_block(self):
+        with open(os.path.join(PROJECT_ROOT, "find_indeed_job.py"),
+                  encoding="utf-8") as handle:
+            source = handle.read()
+        block = source[source.index("INDEED JOB SCRAPER CONFIGURATION"):
+                       source.rindex("END OF CONFIGURATION")]
+        for name in ("XVFB_MODE", "XVFB_DISPLAY", "XVFB_COLOUR_DEPTH"):
+            self.assertIn("\n%s = " % name, block, name)
+
+    def test_they_reach_the_client_config(self):
+        config = F.build_client_config(verbose=False)
+        self.assertEqual(config.xvfb_mode, F.XVFB_MODE)
+        self.assertEqual(config.xvfb_display, F.XVFB_DISPLAY)
+        self.assertEqual(config.xvfb_colour_depth, F.XVFB_COLOUR_DEPTH)
+
+    def test_the_screen_matches_the_browser_window(self):
+        """Xvfb's framebuffer must be the size the browser asks for."""
+        config = F.build_client_config(verbose=False)
+        self.assertEqual("%dx%dx%d" % (config.browser_width,
+                                       config.browser_height,
+                                       config.xvfb_colour_depth),
+                         "%dx%dx%d" % (F.BROWSER_WIDTH, F.BROWSER_HEIGHT,
+                                       F.XVFB_COLOUR_DEPTH))
+
+
+class TestVirtualDisplay(unittest.TestCase):
+    """Xvfb lifecycle. Skipped when Xvfb is not installed."""
+
+    def setUp(self):
+        self.saved = {name: os.environ.get(name)
+                      for name in ("DISPLAY", "WAYLAND_DISPLAY")}
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    def strip_display(self):
+        os.environ.pop("DISPLAY", None)
+        os.environ.pop("WAYLAND_DISPLAY", None)
+
+    def test_a_real_display_is_detected(self):
+        os.environ["DISPLAY"] = ":0"
+        self.assertTrue(VirtualDisplay.display_available())
+        self.strip_display()
+        self.assertFalse(VirtualDisplay.display_available())
+
+    def test_a_wayland_session_counts_as_a_display(self):
+        self.strip_display()
+        os.environ["WAYLAND_DISPLAY"] = "wayland-0"
+        self.assertTrue(VirtualDisplay.display_available())
+
+    @unittest.skipUnless(shutil.which("Xvfb"), "Xvfb is not installed")
+    def test_it_starts_sets_display_and_stops(self):
+        self.strip_display()
+        display = VirtualDisplay(screen="800x600x24", verbose=False)
+        display.start()
+        try:
+            self.assertTrue(display.display.startswith(":"))
+            self.assertEqual(os.environ["DISPLAY"], display.display)
+            self.assertIsNone(display.process.poll(), "Xvfb died")
+            self.assertTrue(os.path.exists(
+                "/tmp/.X11-unix/X%s" % display.display.lstrip(":")))
+        finally:
+            socket = "/tmp/.X11-unix/X%s" % display.display.lstrip(":")
+            display.stop()
+        self.assertIsNone(display.process)
+        self.assertNotIn("DISPLAY", os.environ, "DISPLAY must be restored")
+        self.assertFalse(os.path.exists(socket), "the socket must be gone")
+
+    @unittest.skipUnless(shutil.which("Xvfb"), "Xvfb is not installed")
+    def test_it_restores_a_pre_existing_display(self):
+        os.environ["DISPLAY"] = ":0"
+        display = VirtualDisplay(verbose=False)
+        display.start()
+        self.assertNotEqual(os.environ["DISPLAY"], ":0")
+        display.stop()
+        self.assertEqual(os.environ["DISPLAY"], ":0")
+
+    @unittest.skipUnless(shutil.which("Xvfb"), "Xvfb is not installed")
+    def test_two_displays_do_not_collide(self):
+        """Two ranks on one laptop must not grab the same display number."""
+        self.strip_display()
+        first = VirtualDisplay(verbose=False)
+        second = VirtualDisplay(verbose=False)
+        first.start()
+        try:
+            second.start()
+            try:
+                self.assertNotEqual(first.display, second.display)
+            finally:
+                second.stop()
+        finally:
+            first.stop()
+
+    @unittest.skipUnless(shutil.which("Xvfb"), "Xvfb is not installed")
+    def test_a_requested_display_number_is_honoured(self):
+        self.strip_display()
+        display = VirtualDisplay(display="137", verbose=False)
+        if os.path.exists("/tmp/.X11-unix/X137"):
+            self.skipTest(":137 is already in use on this machine")
+        display.start()
+        try:
+            self.assertEqual(display.display, ":137")
+        finally:
+            display.stop()
+
+    def test_stop_is_safe_before_start_and_twice(self):
+        display = VirtualDisplay(verbose=False)
+        display.stop()
+        display.stop()
+        self.assertIsNone(display.process)
+
+    def test_a_missing_xvfb_is_a_clear_error(self):
+        display = VirtualDisplay(binary="definitely-not-xvfb", verbose=False)
+        self.assertFalse(display.is_installed())
+        with self.assertRaises(BrowserUnavailable) as caught:
+            display.start()
+        message = str(caught.exception)
+        self.assertIn("apt-get install", message)
+        self.assertIn("BROWSER_HEADLESS", message)
+
+
+@needs_browser
+class TestHeadedBrowserWithoutADesktop(unittest.TestCase):
+    """The fleet case: a headed browser on a laptop with no desktop session."""
+
+    def setUp(self):
+        self.saved = {name: os.environ.get(name)
+                      for name in ("DISPLAY", "WAYLAND_DISPLAY")}
+        os.environ.pop("DISPLAY", None)
+        os.environ.pop("WAYLAND_DISPLAY", None)
+        self.transport = None
+
+    def tearDown(self):
+        if self.transport is not None:
+            self.transport.stop()
+            self.transport.cleanup_pages()
+        for name, value in self.saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    @unittest.skipUnless(shutil.which("Xvfb"), "Xvfb is not installed")
+    def test_a_headed_browser_starts_on_a_virtual_display(self):
+        self.transport = BrowserTransport(browser_config(xvfb_mode="auto"))
+        self.transport.start()
+
+        self.assertIsNotNone(self.transport._display,
+                             "a virtual display should have been started")
+        self.assertEqual(os.environ["DISPLAY"],
+                         self.transport._display.display)
+        self.assertTrue(self.transport.browser.is_connected())
+
+        agent = self.transport.page.evaluate("navigator.userAgent")
+        self.assertNotIn("Headless", agent,
+                         "it must still be a HEADED browser, just unwatched")
+        self.assertEqual(self.transport.page.evaluate("screen.width"),
+                         self.transport.config.browser_width)
+
+    @unittest.skipUnless(shutil.which("Xvfb"), "Xvfb is not installed")
+    def test_a_page_can_be_read_through_the_virtual_display(self):
+        self.transport = BrowserTransport(browser_config(xvfb_mode="auto"))
+        self.transport.start()
+        payload = self.transport.search("Network Engineer", "Pune", 1,
+                                        self.transport.config)
+        self.assertTrue(payload["jobs"], "no cards read on a virtual display")
+
+    @unittest.skipUnless(shutil.which("Xvfb"), "Xvfb is not installed")
+    def test_stopping_releases_the_virtual_display(self):
+        transport = BrowserTransport(browser_config(xvfb_mode="auto"))
+        transport.start()
+        display = transport._display.display
+        transport.stop()
+        transport.cleanup_pages()
+        self.assertIsNone(transport._display)
+        self.assertFalse(os.path.exists("/tmp/.X11-unix/X%s"
+                                        % display.lstrip(":")))
+        self.assertNotIn("DISPLAY", os.environ)
+
+    @unittest.skipUnless(shutil.which("Xvfb"), "Xvfb is not installed")
+    def test_an_immediate_kill_also_releases_it(self):
+        transport = BrowserTransport(browser_config(xvfb_mode="auto"))
+        transport.start()
+        display = transport._display.display
+        transport.kill()
+        self.assertIsNone(transport._display)
+        self.assertFalse(os.path.exists("/tmp/.X11-unix/X%s"
+                                        % display.lstrip(":")))
+
+    def test_never_mode_refuses_instead_of_starting_one(self):
+        self.transport = BrowserTransport(browser_config(xvfb_mode="never"))
+        with self.assertRaises(BrowserUnavailable) as caught:
+            self.transport.start()
+        self.transport = None
+        message = str(caught.exception)
+        self.assertIn("XVFB_MODE", message)
+        self.assertIn("BROWSER_HEADLESS", message)
+
+    def test_headless_mode_needs_no_display_at_all(self):
+        self.transport = BrowserTransport(
+            browser_config(browser_headless=True, xvfb_mode="never"))
+        self.transport.start()
+        self.assertIsNone(self.transport._display,
+                          "headless must not start an X server")
+        self.assertTrue(self.transport.browser.is_connected())
+
+
 @needs_browser
 class TestBrowserSelfHealing(unittest.TestCase):
     """A browser that dies under the collector must be relaunched.
@@ -963,39 +1183,70 @@ class TestSalaryAndTypeChip(unittest.TestCase):
 
 
 class TestDisplayGuard(unittest.TestCase):
-    """Visible mode with no display fails loudly, not mysteriously."""
+    """What happens with no display, now that Xvfb is an option.
 
-    def test_no_display_is_a_clear_error(self):
-        saved = {name: os.environ.pop(name, None)
-                 for name in ("DISPLAY", "WAYLAND_DISPLAY")}
-        try:
-            transport = BrowserTransport(browser_config(browser_headless=False))
-            with self.assertRaises(BrowserUnavailable) as caught:
-                transport.start()
-            message = str(caught.exception)
-            self.assertIn("no display", message)
-            self.assertIn("BROWSER_HEADLESS", message)
-        finally:
-            for name, value in saved.items():
-                if value is not None:
-                    os.environ[name] = value
+    Before Xvfb support, "no display" was a hard error. It is now a hard
+    error only when XVFB_MODE is "never" -- otherwise a virtual display is
+    started. Every test here closes whatever it opened: an earlier version
+    of this class left a started transport behind, which broke four later
+    classes in the same process with "Playwright Sync API inside the asyncio
+    loop".
+    """
+
+    def setUp(self):
+        self.saved = {name: os.environ.pop(name, None)
+                      for name in ("DISPLAY", "WAYLAND_DISPLAY")}
+        self.transport = None
+
+    def tearDown(self):
+        if self.transport is not None:
+            self.transport.stop()
+            self.transport.cleanup_pages()
+            self.transport = None
+        for name, value in self.saved.items():
+            if value is not None:
+                os.environ[name] = value
+
+    def test_no_display_with_xvfb_disabled_is_a_clear_error(self):
+        self.transport = BrowserTransport(
+            browser_config(browser_headless=False, xvfb_mode="never"))
+        with self.assertRaises(BrowserUnavailable) as caught:
+            self.transport.start()
+        self.transport = None                        # it never started
+        message = str(caught.exception)
+        self.assertIn("XVFB_MODE", message)
+        self.assertIn("BROWSER_HEADLESS", message)
+
+    @unittest.skipUnless(shutil.which("Xvfb"), "Xvfb is not installed")
+    @unittest.skipUnless(PLAYWRIGHT_AVAILABLE, "needs Playwright")
+    def test_no_display_with_xvfb_auto_just_works(self):
+        self.transport = BrowserTransport(
+            browser_config(browser_headless=False, xvfb_mode="auto"))
+        self.transport.start()
+        self.assertTrue(self.transport.browser.is_connected())
+        self.assertIsNotNone(self.transport._display)
 
     @unittest.skipUnless(PLAYWRIGHT_AVAILABLE, "needs Playwright")
     def test_headless_mode_does_not_need_a_display(self):
-        saved = {name: os.environ.pop(name, None)
-                 for name in ("DISPLAY", "WAYLAND_DISPLAY")}
-        transport = BrowserTransport(browser_config(browser_headless=True))
-        try:
-            transport.start()
-            self.assertTrue(transport.started)
-            agent = transport.page.evaluate("navigator.userAgent")
-            self.assertTrue(agent)
-        finally:
-            transport.stop()
-            transport.cleanup_pages()
-            for name, value in saved.items():
-                if value is not None:
-                    os.environ[name] = value
+        self.transport = BrowserTransport(
+            browser_config(browser_headless=True, xvfb_mode="never"))
+        self.transport.start()
+        self.assertTrue(self.transport.started)
+        self.assertTrue(self.transport.page.evaluate("navigator.userAgent"))
+        self.assertIsNone(self.transport._display)
+
+    @unittest.skipUnless(PLAYWRIGHT_AVAILABLE, "needs Playwright")
+    def test_a_failed_launch_releases_the_virtual_display(self):
+        """An orphaned Xvfb per failed launch would pile up on a laptop."""
+        self.transport = BrowserTransport(browser_config(
+            browser_headless=False, xvfb_mode="auto",
+            browser_channel="definitely-not-a-real-browser-channel"))
+        with self.assertRaises(BrowserUnavailable):
+            self.transport.start()
+        leaked = self.transport._display
+        self.transport = None
+        self.assertIsNone(leaked, "the virtual display was not released")
+        self.assertNotIn("DISPLAY", os.environ)
 
 
 class TestBrowserUnavailableIsReported(unittest.TestCase):

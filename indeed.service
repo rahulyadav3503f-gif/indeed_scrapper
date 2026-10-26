@@ -32,16 +32,23 @@ StandardError=append:/home/ubuntu/check_indeed/indeed.log
 
 # THE VISIBLE BROWSER AND systemd
 # find_indeed_job.py ships with BROWSER_VISIBLE = True / BROWSER_HEADLESS =
-# False, i.e. a Chromium window on the desktop.  A systemd service has no
-# display of its own, so pick one of these:
+# False, i.e. a HEADED Chromium.  A service has no display of its own, and
+# the collector handles that itself: with XVFB_MODE = "auto" (the default) it
+# starts a virtual display (Xvfb) and the browser runs exactly as it does on
+# a desktop -- there is simply no screen to watch it on.  So this unit needs
+# no display configuration at all.
 #
-#   * run it on the desktop session's display -- uncomment the two lines
-#     below (and make sure the user has access to that display);
-#   * or set BROWSER_HEADLESS = True at the top of find_indeed_job.py, which
-#     is the right choice for an unattended server.
+#   REQUIRED ON A MACHINE WITH NO DESKTOP:
+#       sudo apt-get install -y xvfb
+#
+# If you would rather watch it on the desktop's own display, uncomment these
+# two lines instead (the user must have access to that display):
 #
 # Environment=DISPLAY=:0
 # Environment=XAUTHORITY=/home/ubuntu/.Xauthority
+#
+# A third option, needing neither Xvfb nor a display, is
+# BROWSER_HEADLESS = True at the top of find_indeed_job.py.
 
 # Live collection stays off until an authorised source is configured.  To
 # enable it, set these in an environment file and flip

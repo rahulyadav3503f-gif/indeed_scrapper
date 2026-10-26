@@ -46,6 +46,7 @@ import hashlib
 import json
 import os
 import signal
+import subprocess
 import random
 import re
 import shutil
@@ -166,6 +167,9 @@ class IndeedClientConfig:
         browser_nav_timeout_ms=45000,
         browser_keep_open_seconds=0,
         browser_demo_pages=True,
+        xvfb_mode="auto",
+        xvfb_display="",
+        xvfb_colour_depth=24,
         browser_live_search_url="",
         browser_live_detail_url="",
         browser_live_authorised=False,
@@ -221,6 +225,9 @@ class IndeedClientConfig:
         self.browser_nav_timeout_ms = max(1000, int(browser_nav_timeout_ms))
         self.browser_keep_open_seconds = max(0, int(browser_keep_open_seconds))
         self.browser_demo_pages = bool(browser_demo_pages)
+        self.xvfb_mode = str(xvfb_mode or "auto").lower()
+        self.xvfb_display = str(xvfb_display or "")
+        self.xvfb_colour_depth = max(8, int(xvfb_colour_depth))
         self.browser_live_search_url = str(browser_live_search_url or "")
         self.browser_live_detail_url = str(browser_live_detail_url or "")
         self.browser_live_authorised = bool(browser_live_authorised)
@@ -920,6 +927,182 @@ class BrowserUnavailable(IndeedClientError):
     """Playwright or Chromium is not usable on this machine."""
 
 
+# ---------------------------------------------------------------------------
+# VIRTUAL DISPLAY (Xvfb)
+# ---------------------------------------------------------------------------
+# WHY
+# The collector runs a HEADED Chromium, which needs an X display. On the
+# machine it was built on that is the desktop's own display, so there is a
+# window to watch. On the other laptops in the fleet there may be no desktop
+# session at all -- the run is started over SSH, or by systemd at boot --
+# and a headed browser then has nowhere to draw.
+#
+# Xvfb ("X virtual framebuffer") is an X server that renders into memory
+# instead of a screen. Chromium launches exactly as it does on a desktop and
+# behaves identically; the only difference is that nobody is watching.
+#
+# WHAT THIS IS NOT
+# It is not an attempt to hide anything. The browser is the same build, the
+# same user agent and the same behaviour as on the desktop; Xvfb just gives
+# it a place to draw. The alternative -- BROWSER_HEADLESS = True -- is also
+# supported and is one setting away.
+
+
+class VirtualDisplay:
+    """An Xvfb server owned by this process.
+
+    Started only when it is needed: a real display is always preferred, so
+    on the desktop machine this class does nothing at all.
+    """
+
+    def __init__(self, display=None, screen="1366x768x24", verbose=True,
+                 binary="Xvfb", start_timeout=10.0):
+        self.requested_display = str(display or "").strip()
+        self.screen = str(screen or "1366x768x24")
+        self.verbose = bool(verbose)
+        self.binary = str(binary or "Xvfb")
+        self.start_timeout = float(start_timeout)
+
+        self.display = ""
+        self.process = None
+        self._previous_display = None
+        self._started_here = False
+
+    # -- availability -------------------------------------------------------
+
+    @staticmethod
+    def display_available() -> bool:
+        """True when something is already there to draw on."""
+        return bool(os.environ.get("DISPLAY")
+                    or os.environ.get("WAYLAND_DISPLAY"))
+
+    def is_installed(self) -> bool:
+        return shutil.which(self.binary) is not None
+
+    @staticmethod
+    def _socket_path(number) -> str:
+        return "/tmp/.X11-unix/X%d" % int(number)
+
+    def _free_display_number(self) -> int:
+        """The first display number nothing else is using.
+
+        Display numbers are machine-wide, so two ranks started on the same
+        laptop must not pick the same one. The socket file is the thing that
+        actually clashes, so that is what is checked.
+        """
+        for number in range(99, 199):
+            if not os.path.exists(self._socket_path(number)):
+                return number
+        raise BrowserUnavailable(
+            "no free X display number between :99 and :198 -- something has "
+            "left a great many X sockets behind in /tmp/.X11-unix")
+
+    # -- lifecycle ----------------------------------------------------------
+
+    def start(self):
+        """Start Xvfb and point DISPLAY at it.  Returns self."""
+        if self.process is not None:
+            return self
+
+        if not self.is_installed():
+            raise BrowserUnavailable(
+                "a virtual display was requested but %s is not installed.\n"
+                "        Install it:  sudo apt-get install -y xvfb\n"
+                "        Or set BROWSER_HEADLESS = True at the top of "
+                "find_indeed_job.py, which needs no display at all."
+                % self.binary)
+
+        if self.requested_display:
+            display = self.requested_display
+            if not display.startswith(":"):
+                display = ":" + display
+            number = int(re.sub(r"\D", "", display) or 99)
+        else:
+            number = self._free_display_number()
+            display = ":%d" % number
+
+        command = [self.binary, display, "-screen", "0", self.screen,
+                   "-nolisten", "tcp"]
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as error:
+            raise BrowserUnavailable("could not start %s: %s"
+                                     % (self.binary, error))
+
+        # Wait for the server to actually be listening. Launching Chromium
+        # against a display that is not up yet fails with a bare
+        # "Missing X server", which is a confusing way to learn this.
+        socket_path = self._socket_path(number)
+        deadline = time.monotonic() + self.start_timeout
+        while time.monotonic() < deadline:
+            if os.path.exists(socket_path):
+                break
+            if self.process.poll() is not None:
+                stderr = ""
+                try:
+                    stderr = (self.process.stderr.read() or b"").decode(
+                        "utf-8", "replace").strip()
+                except Exception:
+                    pass
+                self.process = None
+                raise BrowserUnavailable(
+                    "%s exited immediately%s" % (self.binary,
+                                                 ": " + stderr if stderr else ""))
+            time.sleep(0.1)
+        else:
+            self.stop()
+            raise BrowserUnavailable(
+                "%s did not come up within %.0fs (no socket at %s)"
+                % (self.binary, self.start_timeout, socket_path))
+
+        self.display = display
+        self._previous_display = os.environ.get("DISPLAY")
+        os.environ["DISPLAY"] = display
+        self._started_here = True
+
+        if self.verbose:
+            print("   [DISPLAY] virtual display %s started (%s) -- the "
+                  "browser runs normally, there is just no screen to watch it "
+                  "on" % (display, self.screen), flush=True)
+        return self
+
+    def stop(self):
+        """Stop Xvfb and restore DISPLAY.  Never raises."""
+        process, self.process = self.process, None
+        if process is not None:
+            for finish in (process.terminate, process.kill):
+                try:
+                    finish()
+                    process.wait(timeout=5)
+                    break
+                except Exception:
+                    continue
+            try:
+                if process.stderr is not None:
+                    process.stderr.close()
+            except Exception:
+                pass
+
+        if self._started_here:
+            if self._previous_display is None:
+                os.environ.pop("DISPLAY", None)
+            else:
+                os.environ["DISPLAY"] = self._previous_display
+            self._started_here = False
+        self.display = ""
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stop()
+        return False
+
+
 class DemoPageBuilder:
     """Writes local HTML job pages for the visible-browser demonstration.
 
@@ -1135,6 +1318,8 @@ class BrowserTransport(BaseTransport):
         # The Playwright driver subprocess this transport launched, so an
         # immediate stop can kill exactly that and nothing else.
         self._driver_pid = None
+        # An Xvfb server, when this transport had to start one.
+        self._display = None
 
         # Where the demonstration pages come from.  The fixture source is the
         # offline transport, so the demo shows exactly the fixture records the
@@ -1165,15 +1350,20 @@ class BrowserTransport(BaseTransport):
                 "  pip install playwright && python -m playwright install "
                 "chromium" % error)
 
-        if not self.config.browser_headless and not (
-                os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-            raise BrowserUnavailable(
-                "BROWSER_HEADLESS is False but there is no display: neither "
-                "DISPLAY nor WAYLAND_DISPLAY is set.  Run the collector from "
-                "a desktop session, give the service a display "
-                "(Environment=DISPLAY=:0 in indeed.service), or set "
-                "BROWSER_HEADLESS = True at the top of find_indeed_job.py.")
+        if not self.config.browser_headless:
+            self._ensure_display()
 
+        # From here on, ANY failure must release the virtual display again --
+        # otherwise a failed launch leaves an orphaned Xvfb server behind,
+        # and on a laptop that restarts the collector in a loop they pile up.
+        try:
+            return self._start_browser(sync_playwright)
+        except Exception:
+            self.stop()
+            raise
+
+    def _start_browser(self, sync_playwright):
+        """Launch Chromium onto the display that is now guaranteed to exist."""
         self._playwright = sync_playwright().start()
 
         launch_options = {
@@ -1240,6 +1430,46 @@ class BrowserTransport(BaseTransport):
                 self.config.describe()))
         return self
 
+    def _ensure_display(self):
+        """Make sure a headed Chromium has somewhere to draw.
+
+        Order of preference:
+
+          1. a real display -- the desktop machine, so the window is
+             watchable and nothing extra is started;
+          2. a virtual display (Xvfb), which is what the other laptops in
+             the fleet use: no desktop session, no window, identical
+             browser behaviour;
+          3. a clear error naming both ways out, rather than Chromium's
+             bare "Missing X server".
+
+        ``xvfb_mode``:
+          "auto"  start Xvfb only when there is no real display  (default)
+          "always" always use Xvfb, even on a desktop -- useful for testing
+                   the fleet's exact configuration on this machine
+          "never"  never start it; no display is then a hard error
+        """
+        mode = str(getattr(self.config, "xvfb_mode", "auto")).lower()
+
+        if VirtualDisplay.display_available() and mode != "always":
+            return
+
+        if mode == "never":
+            raise BrowserUnavailable(
+                "BROWSER_HEADLESS is False but there is no display, and "
+                "XVFB_MODE is \"never\".  Either run from a desktop "
+                "session, set XVFB_MODE = \"auto\" to let the collector "
+                "start a virtual display, or set BROWSER_HEADLESS = True.")
+
+        self._display = VirtualDisplay(
+            display=self.config.xvfb_display,
+            screen="%dx%dx%d" % (self.config.browser_width,
+                                 self.config.browser_height,
+                                 self.config.xvfb_colour_depth),
+            verbose=self.config.verbose,
+        )
+        self._display.start()
+
     def _show_demonstration_notice(self):
         """Put the demonstration notice on screen before anything else."""
         notice = (
@@ -1293,6 +1523,11 @@ class BrowserTransport(BaseTransport):
         self._playwright = None
         self._driver_pid = None
         self.started = False
+
+        # The virtual display goes last: the browser was drawing on it.
+        if self._display is not None:
+            self._display.stop()
+            self._display = None
 
     close = stop
 
@@ -1354,9 +1589,25 @@ class BrowserTransport(BaseTransport):
             except Exception:
                 pass
 
+        # Tidy Playwright's own sync machinery after the kill. Killing the
+        # driver leaves a thread-local event loop behind, and the NEXT
+        # sync_playwright().start() in this process then fails with "you are
+        # using Playwright Sync API inside the asyncio loop" -- so a kill
+        # would quietly make the process unable to open another browser.
+        # Measured: with this call a relaunch works, without it it does not.
+        if self._playwright is not None:
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
+
         self.context = self.browser = self.page = self.detail_page = None
         self._playwright = None
         self._driver_pid = None
+
+        if self._display is not None:
+            self._display.stop()
+            self._display = None
 
     def cleanup_pages(self):
         if self.pages is not None:

@@ -39,6 +39,20 @@ else
     echo "Falling back to $PYTHON for now."
 fi
 
+# A service has no display, so a headed Chromium needs Xvfb. The collector
+# starts it itself (XVFB_MODE = "auto"), but the package has to be there.
+if grep -qE '^BROWSER_HEADLESS\s*=\s*False' "$PROJECT_DIR/find_indeed_job.py" \
+   && ! command -v Xvfb >/dev/null 2>&1; then
+    echo
+    echo "  WARNING: BROWSER_HEADLESS is False (a headed browser) but Xvfb is"
+    echo "           not installed, and a service has no display of its own."
+    echo
+    echo "           Install it:   sudo apt-get install -y xvfb"
+    echo "           Or set        BROWSER_HEADLESS = True"
+    echo "           at the top of find_indeed_job.py."
+    echo
+fi
+
 RUN_USER="$(id -un)"
 RUN_GROUP="$(id -gn)"
 

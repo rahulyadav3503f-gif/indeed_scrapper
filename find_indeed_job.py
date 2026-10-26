@@ -260,6 +260,24 @@ BROWSER_SLOW_MO_MS = 350
 BROWSER_WIDTH = 1366
 BROWSER_HEIGHT = 768
 
+# RUNNING ON A LAPTOP WITH NO DESKTOP SESSION (the rest of the fleet)
+# A headed Chromium needs an X display. When there is none -- the run was
+# started over SSH, or by systemd at boot -- the collector starts a virtual
+# one (Xvfb) and the browser behaves exactly as it does on the desktop; the
+# only difference is that there is no screen to watch it on.
+#
+#   XVFB_MODE  "auto"   start Xvfb only when no real display exists (default)
+#              "always" always use Xvfb, even on a desktop -- lets this
+#                       machine reproduce the fleet's exact configuration
+#              "never"  never start it; no display is then a hard error
+#
+# Needs the package:  sudo apt-get install -y xvfb
+# The alternative, needing no display and no package at all, is
+# BROWSER_HEADLESS = True.
+XVFB_MODE = "auto"
+XVFB_DISPLAY = ""                   # "" = pick the first free one (:99 up)
+XVFB_COLOUR_DEPTH = 24              # the screen is BROWSER_WIDTH x HEIGHT
+
 BROWSER_REQUIRED = True             # this collector needs a browser to run
 BROWSER_CHANNEL = ""                # "" = Playwright's own Chromium build
 BROWSER_NAV_TIMEOUT_MS = 45000
@@ -1444,6 +1462,9 @@ def build_client_config(verbose=None) -> IndeedClientConfig:
         browser_nav_timeout_ms=BROWSER_NAV_TIMEOUT_MS,
         browser_keep_open_seconds=BROWSER_KEEP_OPEN_SECONDS,
         browser_demo_pages=BROWSER_DEMO_PAGES,
+        xvfb_mode=XVFB_MODE,
+        xvfb_display=XVFB_DISPLAY,
+        xvfb_colour_depth=XVFB_COLOUR_DEPTH,
         browser_live_search_url=os.environ.get(
             BROWSER_LIVE_SEARCH_URL_ENV, ""),
         browser_live_detail_url=os.environ.get(

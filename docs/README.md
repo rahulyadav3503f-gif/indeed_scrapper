@@ -290,6 +290,12 @@ pip install -r requirements.txt
 python3 -m playwright install chromium
 ```
 
+On a machine with no desktop session, also:
+
+```bash
+sudo apt-get install -y xvfb
+```
+
 The last line downloads the Chromium build Playwright drives. Without it the
 collector stops at startup with an explicit "run `python -m playwright
 install chromium`" message rather than failing obscurely.
@@ -405,12 +411,24 @@ asserting that the collection is authorised.
 * The Apply button's `href` is read; the button is never clicked. No
   application is submitted and no resume is uploaded.
 
-### Running it as a service
+### Running it where there is no desktop (the other laptops)
 
-A systemd service has no display of its own. Either give the unit the
-desktop's display (`Environment=DISPLAY=:0` — the lines are in
-`indeed.service`, commented out), or set `BROWSER_HEADLESS = True`, which is
-the right answer for an unattended server.
+A headed Chromium needs an X display, and a laptop started over SSH or by
+systemd has none. The collector starts a **virtual display** (Xvfb) by
+itself in that case, so `python3 find_indeed_job.py` stays the whole
+command on every machine:
+
+```python
+XVFB_MODE = "auto"          # "auto" | "always" | "never"
+XVFB_DISPLAY = ""           # "" = first free display, :99 upward
+XVFB_COLOUR_DEPTH = 24
+```
+
+It needs the package: `sudo apt-get install -y xvfb`. `./indeed status`
+prints which display would be used, and **docs/DEPLOYMENT_XVFB.md** is the
+full per-laptop deployment guide (rank, saved login, service, verification,
+troubleshooting). `BROWSER_HEADLESS = True` remains the option that needs no
+display and no package at all.
 
 ---
 
