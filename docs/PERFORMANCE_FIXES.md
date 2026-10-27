@@ -275,6 +275,96 @@ raise `MAX_LISTING_PAGES` to go deeper into big-city results. 13 tests in
 
 ---
 
+## 6b. Delay ranges and an escalating 403 cooldown (27 October)
+
+### The three crawl delays are now MIN/MAX ranges
+
+They were a single number each plus a shared jitter fraction, so the real
+delay was `base x (1 + random(0, 0.35))` -- correct, but hard to read off
+the configuration. Each one is now an explicit range, drawn uniformly on
+every use:
+
+```python
+JOB_GAP_MIN_SECONDS = 10.0      # after each job detail page
+JOB_GAP_MAX_SECONDS = 14.0
+CITY_GAP_MIN_SECONDS = 15.0     # between two cities
+CITY_GAP_MAX_SECONDS = 21.0
+KEYWORD_GAP_MIN_SECONDS = 15.0  # between two keywords
+KEYWORD_GAP_MAX_SECONDS = 21.0
+```
+
+The shipped ranges reproduce the pacing that was tuned after the 429: the
+old `base`..`base x 1.35` became `MIN`..`MAX`, so nothing got faster or
+slower by accident. `MIN == MAX` is a fixed delay, `0` is no delay, and a
+reversed pair is swapped rather than producing a negative one.
+
+`pick_delay(min, max)` does the draw and `sleep_between(min, max, label)`
+waits, logging what it drew and the range it drew from:
+
+```
+      ... next job page in 12.4s (random 10-14s)
+```
+
+`REQUEST_GAP_SECONDS` (the gap before each individual page request) is
+unchanged, still one number with jitter -- it follows the source's own pace
+rather than the crawl's shape.
+
+### A 403 now escalates, then the unit is skipped
+
+Before: every refusal cost the same 10 minutes, and after three of them the
+**run stopped**. One job the source would not serve could therefore end a
+night's collecting.
+
+Now the wait grows with each *consecutive* refusal, and when the escalation
+is spent the refused unit is given up on and the crawl carries on:
+
+| Consecutive refusal | What happens |
+|---------------------|--------------|
+| 1st | wait 1 x `ACCESS_BREAK_SECONDS` = 10 min |
+| 2nd | wait 2 x = 20 min |
+| 3rd | wait 3 x = 30 min |
+| 4th | wait 4 x = 40 min |
+| 5th | **skip that job / listing page**, record it as `manual` in `failed_pages.json`, reset the escalation, keep crawling |
+
+```
+   [would sleep 10m 00s] HTTP 403 access break 1/4 -- 1x the 10m 00s base cooldown
+   [would sleep 20m 00s] HTTP 403 access break 2/4 -- 2x the 10m 00s base cooldown
+   [would sleep 30m 00s] HTTP 403 access break 3/4 -- 3x the 10m 00s base cooldown
+   [would sleep 40m 00s] HTTP 403 access break 4/4 -- 4x the 10m 00s base cooldown
+GIVING UP ON THIS UNIT. HTTP 403 survived all 4 escalating cooldowns
+```
+
+Two details that matter:
+
+* **"Consecutive" means with no successful page in between.** The client now
+  counts successful requests; if that count has moved since the last block,
+  real collection happened and the escalation restarts at 1x. A refusal this
+  morning does not make this evening's refusal wait 20 minutes.
+* **A `Retry-After` from the source still wins when it asks for longer** --
+  `max()`, never `min()`. Our own schedule can lengthen a wait, never
+  shorten one the source asked for.
+
+Settings: `ACCESS_BREAK_SECONDS = 600` (the 1x base) and
+`MAX_BLOCK_COOLDOWNS = 4` (how many escalating cooldowns before the skip).
+Set `MAX_BLOCK_COOLDOWNS = 2` for a quicker give-up, or raise
+`ACCESS_BREAK_SECONDS` to be gentler.
+
+### The one case where the run still stops
+
+If refusals look **session-wide** -- distinct urls refused with no successful
+page in between, i.e. the source is refusing everything, not one bad job --
+the run still ends with every checkpoint intact. Skipping unit after unit
+in that situation would mean hammering a source that has just said no, which
+is the one thing this collector must not do. Re-running continues from the
+exact position once access is back.
+
+16 tests cover both changes in `tests/test_error_handling.py`
+(`TestEscalatingAccessCooldown`, `TestCrawlDelayRanges`), including the
+escalation sequence, the skip, the reset after a success, and that a longer
+`Retry-After` is never shortened.
+
+---
+
 ## 7. Two unrelated defects found while measuring
 
 **`BrowserTransport.kill()` was too broad.** The immediate-stop path (Ctrl+C)

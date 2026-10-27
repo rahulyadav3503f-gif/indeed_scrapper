@@ -29,14 +29,19 @@ class CheckpointTestCase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="indeed-state-")
         self._saved = {name: getattr(F, name) for name in
                        ("BASE_DIR", "VERBOSE", "REQUEST_GAP_SECONDS",
-                        "JOB_GAP_SECONDS", "CITY_GAP_SECONDS",
-                        "KEYWORD_GAP_SECONDS", "NIGHT_PAUSE_ENABLED")}
+                        "JOB_GAP_MIN_SECONDS", "JOB_GAP_MAX_SECONDS",
+                        "CITY_GAP_MIN_SECONDS", "CITY_GAP_MAX_SECONDS",
+                        "KEYWORD_GAP_MIN_SECONDS",
+                        "KEYWORD_GAP_MAX_SECONDS", "NIGHT_PAUSE_ENABLED")}
         F.BASE_DIR = self.tmp
         F.VERBOSE = False
         F.REQUEST_GAP_SECONDS = 0
-        F.JOB_GAP_SECONDS = 0
-        F.CITY_GAP_SECONDS = 0
-        F.KEYWORD_GAP_SECONDS = 0
+        F.JOB_GAP_MIN_SECONDS = 0
+        F.JOB_GAP_MAX_SECONDS = 0
+        F.CITY_GAP_MIN_SECONDS = 0
+        F.CITY_GAP_MAX_SECONDS = 0
+        F.KEYWORD_GAP_MIN_SECONDS = 0
+        F.KEYWORD_GAP_MAX_SECONDS = 0
         F.NIGHT_PAUSE_ENABLED = False
 
     def tearDown(self):

@@ -46,15 +46,20 @@ class ErrorTestCase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="indeed-errors-")
         self._saved = {name: getattr(F, name) for name in
                        ("BASE_DIR", "VERBOSE", "REQUEST_GAP_SECONDS",
-                        "JOB_GAP_SECONDS", "CITY_GAP_SECONDS",
-                        "KEYWORD_GAP_SECONDS", "NIGHT_PAUSE_ENABLED",
+                        "JOB_GAP_MIN_SECONDS", "JOB_GAP_MAX_SECONDS",
+                        "CITY_GAP_MIN_SECONDS", "CITY_GAP_MAX_SECONDS",
+                        "KEYWORD_GAP_MIN_SECONDS",
+                        "KEYWORD_GAP_MAX_SECONDS", "NIGHT_PAUSE_ENABLED",
                         "_SHUTDOWN_REQUESTED")}
         F.BASE_DIR = self.tmp
         F.VERBOSE = False
         F.REQUEST_GAP_SECONDS = 0
-        F.JOB_GAP_SECONDS = 0
-        F.CITY_GAP_SECONDS = 0
-        F.KEYWORD_GAP_SECONDS = 0
+        F.JOB_GAP_MIN_SECONDS = 0
+        F.JOB_GAP_MAX_SECONDS = 0
+        F.CITY_GAP_MIN_SECONDS = 0
+        F.CITY_GAP_MAX_SECONDS = 0
+        F.KEYWORD_GAP_MIN_SECONDS = 0
+        F.KEYWORD_GAP_MAX_SECONDS = 0
         F.NIGHT_PAUSE_ENABLED = False
         F._SHUTDOWN_REQUESTED = False
 
@@ -109,6 +114,180 @@ class TestAccessDenied(ErrorTestCase):
             F.run_combo(client, state, "IT Department", "Network Engineer",
                         "Pune", {})
         self.assertEqual(caught.exception.scope, "session_wide")
+
+
+class TestEscalatingAccessCooldown(ErrorTestCase):
+    """403: the cooldown grows, then the unit is skipped and the crawl goes on.
+
+    Before this, every refusal cost the same 10 minutes and the run STOPPED
+    after three of them -- so one job the source would not serve could end a
+    night's collecting.
+    """
+
+    def waits(self, refusals, retry_after=None, successes_between=()):
+        """The sleeps main() would take for N consecutive refusals.
+
+        Drives the real handler with the real client, and records what it
+        asks to sleep for instead of sleeping.
+        """
+        slept = []
+        skipped = []
+        calls = {"n": 0}
+
+        class Denier(FixtureTransport):
+            def __init__(self):
+                super().__init__()
+                self.successes = 0
+
+            def search(self, keyword, city, page, config):
+                calls["n"] += 1
+                if calls["n"] in successes_between:
+                    self.successes += 1
+                    return {"jobs": [], "total": 0}
+                if retry_after is not None:
+                    # Only a 429 carries a Retry-After; that is the path
+                    # where the source's own wait must win.
+                    raise IndeedRateLimited("quota", url="u%d" % calls["n"],
+                                            retry_after=retry_after)
+                raise IndeedAccessDenied("denied", url="u%d" % calls["n"],
+                                         status=403)
+
+        transport = Denier()
+        client = IndeedClient(IndeedClientConfig(verbose=False,
+                                                 request_gap_seconds=0),
+                              transport=transport)
+
+        original_sleep = F.sleep_long
+        original_record = F.record_failed
+        F.sleep_long = lambda seconds, reason: slept.append(int(seconds))
+        F.record_failed = lambda *a, **k: skipped.append(
+            k.get("recovery_status"))
+        try:
+            state = F.load_or_open_crawl_cycle(CITIES, PAIRS)
+            block_cooldowns = 0
+            mark = 0
+            for _ in range(refusals):
+                try:
+                    F.run_combo(client, state, "IT Department",
+                                "Network Engineer", "Pune", {})
+                except F.AccessBlocked as blocked:
+                    progress = F.client_success_count(client)
+                    if progress > mark:
+                        block_cooldowns = 0
+                    mark = progress
+                    block_cooldowns += 1
+                    if block_cooldowns > F.MAX_BLOCK_COOLDOWNS:
+                        F.record_failed(blocked.work_type, blocked.reference,
+                                        "skipped", status=blocked.status,
+                                        recovery_status="manual")
+                        block_cooldowns = 0
+                        slept.append(0)          # a skip costs no wait
+                        continue
+                    wait = max(F.ACCESS_BREAK_SECONDS * block_cooldowns,
+                               int(blocked.wait_seconds or 0))
+                    F.sleep_long(wait, "")
+        finally:
+            F.sleep_long = original_sleep
+            F.record_failed = original_record
+        return slept, skipped
+
+    def test_the_cooldown_doubles_then_triples_then_quadruples(self):
+        base = F.ACCESS_BREAK_SECONDS
+        slept, _skipped = self.waits(4)
+        self.assertEqual(slept, [base, base * 2, base * 3, base * 4])
+
+    def test_the_fifth_refusal_skips_the_unit_instead_of_waiting(self):
+        slept, skipped = self.waits(5)
+        self.assertEqual(slept[-1], 0, "the skip must not cost a cooldown")
+        self.assertIn("manual", skipped,
+                      "the skipped unit must be recorded for review")
+
+    def test_the_escalation_restarts_after_the_skip(self):
+        base = F.ACCESS_BREAK_SECONDS
+        slept, _skipped = self.waits(6)
+        self.assertEqual(slept, [base, base * 2, base * 3, base * 4, 0, base],
+                         "after a skip the next refusal starts again at 1x")
+
+    def test_a_successful_page_resets_the_escalation(self):
+        """A refusal with collection in between is not "consecutive"."""
+        base = F.ACCESS_BREAK_SECONDS
+        # the 3rd request succeeds, so the refusal after it starts at 1x
+        slept, _skipped = self.waits(4, successes_between={3})
+        self.assertEqual(slept[:2], [base, base * 2])
+        self.assertEqual(slept[2], base,
+                         "a success in between must reset the escalation")
+
+    def test_a_longer_retry_after_is_never_shortened(self):
+        huge = F.ACCESS_BREAK_SECONDS * 9
+        slept, _skipped = self.waits(1, retry_after=huge)
+        self.assertEqual(slept, [huge],
+                         "max(), never min() -- the source's own wait wins")
+
+    def test_the_configured_escalation_is_described_for_the_log(self):
+        described = F.describe_escalation()
+        self.assertEqual(described.count(","), F.MAX_BLOCK_COOLDOWNS - 1)
+        self.assertIn(F.human_duration(F.ACCESS_BREAK_SECONDS), described)
+        self.assertIn(F.human_duration(F.ACCESS_BREAK_SECONDS
+                                       * F.MAX_BLOCK_COOLDOWNS), described)
+
+    def test_four_cooldowns_are_configured(self):
+        self.assertEqual(F.MAX_BLOCK_COOLDOWNS, 4,
+                         "1x, 2x, 3x, 4x then skip")
+        self.assertEqual(F.ACCESS_BREAK_SECONDS, 600)
+
+
+class TestCrawlDelayRanges(ErrorTestCase):
+    """Job, city and keyword delays are random values between MIN and MAX."""
+
+    def test_the_three_ranges_exist_and_are_ordered(self):
+        for low, high in ((F.JOB_GAP_MIN_SECONDS, F.JOB_GAP_MAX_SECONDS),
+                          (F.CITY_GAP_MIN_SECONDS, F.CITY_GAP_MAX_SECONDS),
+                          (F.KEYWORD_GAP_MIN_SECONDS,
+                           F.KEYWORD_GAP_MAX_SECONDS)):
+            self.assertGreaterEqual(low, 0)
+            self.assertGreaterEqual(high, low)
+
+    def test_a_draw_lands_inside_the_range(self):
+        for _ in range(200):
+            value = F.pick_delay(10, 14)
+            self.assertGreaterEqual(value, 10)
+            self.assertLessEqual(value, 14)
+
+    def test_draws_actually_vary(self):
+        draws = {round(F.pick_delay(10, 14), 3) for _ in range(50)}
+        self.assertGreater(len(draws), 1, "the delay must not be fixed")
+
+    def test_an_equal_pair_is_a_fixed_delay(self):
+        self.assertEqual(F.pick_delay(7, 7), 7.0)
+
+    def test_a_reversed_pair_is_tolerated(self):
+        for _ in range(50):
+            value = F.pick_delay(14, 10)
+            self.assertGreaterEqual(value, 10)
+            self.assertLessEqual(value, 14)
+
+    def test_zero_means_no_delay(self):
+        self.assertEqual(F.pick_delay(0, 0), 0.0)
+
+    def test_a_negative_pair_cannot_produce_a_negative_delay(self):
+        self.assertGreaterEqual(F.pick_delay(-5, -1), 0.0)
+
+    def test_rubbish_input_is_not_fatal(self):
+        self.assertEqual(F.pick_delay("x", None), 0.0)
+
+    def test_sleep_between_waits_within_the_range(self):
+        import time as time_module
+        started = time_module.monotonic()
+        F.sleep_between(0.05, 0.15)
+        elapsed = time_module.monotonic() - started
+        self.assertGreaterEqual(elapsed, 0.04)
+        self.assertLess(elapsed, 0.6)
+
+    def test_sleep_between_zero_returns_at_once(self):
+        import time as time_module
+        started = time_module.monotonic()
+        F.sleep_between(0, 0)
+        self.assertLess(time_module.monotonic() - started, 0.05)
 
 
 class TestRateLimit(ErrorTestCase):

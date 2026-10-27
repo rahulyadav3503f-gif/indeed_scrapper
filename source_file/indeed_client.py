@@ -2534,6 +2534,11 @@ class IndeedClient:
     def __init__(self, config=None, transport=None):
         self.config = config or IndeedClientConfig()
         self.requests_made = 0
+        # Requests that actually came back with data. The main
+        # script uses this to tell a fresh access refusal from a
+        # continuing one, so the 403 escalation resets after real
+        # collection rather than carrying on from an old problem.
+        self.successful_requests = 0
         self.last_request_at = 0.0
         self._distinct_denied_urls = set()
 
@@ -2688,6 +2693,7 @@ class IndeedClient:
 
         # A successful read is the only evidence that access is back.
         self._distinct_denied_urls.clear()
+        self.successful_requests += 1
         return [job for job in jobs if isinstance(job, dict)], total
 
     def page_count(self, total_jobs, per_page=None, cap=None,
@@ -2779,6 +2785,7 @@ class IndeedClient:
             merged.update(detail)
             detail = merged
         self._distinct_denied_urls.clear()
+        self.successful_requests += 1
         return detail
 
     @staticmethod

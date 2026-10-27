@@ -23,9 +23,12 @@ from source_file.indeed_client import (            # noqa: E402
 # about the crawl LOGIC is changed by zeroing them.
 FAST_SETTINGS = {
     "REQUEST_GAP_SECONDS": 0,
-    "JOB_GAP_SECONDS": 0,
-    "CITY_GAP_SECONDS": 0,
-    "KEYWORD_GAP_SECONDS": 0,
+    "JOB_GAP_MIN_SECONDS": 0,
+    "JOB_GAP_MAX_SECONDS": 0,
+    "CITY_GAP_MIN_SECONDS": 0,
+    "CITY_GAP_MAX_SECONDS": 0,
+    "KEYWORD_GAP_MIN_SECONDS": 0,
+    "KEYWORD_GAP_MAX_SECONDS": 0,
     "CYCLE_COOLDOWN_MINUTES": 0,
     "NIGHT_PAUSE_ENABLED": False,
     "VERBOSE": False,

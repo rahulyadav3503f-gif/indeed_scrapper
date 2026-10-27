@@ -179,11 +179,23 @@ WORK_PERIOD_MAX_HOURS = 4.2
 
 # -- Request pacing ---------------------------------------------------------
 #MIN AND MAX
-REQUEST_GAP_SECONDS = 5.0       # polite gap between source requests
-JOB_GAP_SECONDS = 10.0           # between two job detail reads
-CITY_GAP_SECONDS = 15            # between two cities
-KEYWORD_GAP_SECONDS = 15        # between two keywords
+REQUEST_GAP_SECONDS = 5.0       # polite gap before each source request
 PACING_JITTER_FRACTION = 0.35   # spreads the ranks apart; not evasion
+
+# THE THREE CRAWL DELAYS ARE RANGES, NOT FIXED NUMBERS
+# Each one is drawn fresh, uniformly, between its MIN and its MAX every time
+# it is used. Two reasons: a fleet of five ranks does not fall into step and
+# queue up on the source together, and a range is easier to tune than a base
+# plus a jitter fraction -- what you write is exactly what you get.
+#
+# MIN == MAX is allowed and means a fixed delay. MIN > MAX is tolerated (they
+# are swapped), and 0 means no delay at all.
+JOB_GAP_MIN_SECONDS = 10.0      # after each job detail page
+JOB_GAP_MAX_SECONDS = 14.0
+CITY_GAP_MIN_SECONDS = 15.0     # between two cities
+CITY_GAP_MAX_SECONDS = 21.0
+KEYWORD_GAP_MIN_SECONDS = 15.0  # between two keywords
+KEYWORD_GAP_MAX_SECONDS = 21.0
 
 # -- HTTP timeout settings --------------------------------------------------
 HTTP_CONNECT_TIMEOUT_SECONDS = 10
@@ -199,8 +211,23 @@ MAX_RETRIES_429 = 3
 BACKOFF_429_SECONDS = (60, 180)             # only when Retry-After is absent
 DEFAULT_429_WAIT_SECONDS = 120
 RETRY_AFTER_CAP_SECONDS = 3600
-ACCESS_BREAK_SECONDS = 600                  # the 403 cooldown
-MAX_BLOCK_COOLDOWNS = 3                     # then stop, checkpoint intact
+# THE 403 COOLDOWN ESCALATES, THEN THE REFUSED UNIT IS SKIPPED
+# A refusal used to cost the same 10-minute wait every time, so a job the
+# source will not serve could hold the crawl up indefinitely. The wait now
+# grows with each CONSECUTIVE refusal, and once the escalation is spent the
+# refused job (or listing page) is given up on and the crawl carries on:
+#
+#   1st refusal  ->  1 x ACCESS_BREAK_SECONDS   (10 min)
+#   2nd          ->  2 x                        (20 min)
+#   3rd          ->  3 x                        (30 min)
+#   4th          ->  4 x                        (40 min)
+#   5th          ->  SKIP that unit, reset the escalation, keep crawling
+#
+# "Consecutive" means with no successful page in between: one good page
+# resets the escalation to 1x. A Retry-After from the source is still
+# honoured when it asks for longer -- max(), never min().
+ACCESS_BREAK_SECONDS = 600                  # the base 403 cooldown (1x)
+MAX_BLOCK_COOLDOWNS = 4                     # 1x..4x, then skip the unit
 UNEXPECTED_ERROR_COOLDOWN_SECONDS = 300
 
 # -- Failed-work queue ------------------------------------------------------
@@ -1108,8 +1135,44 @@ def pacing_gate() -> None:
             break_seconds)
 
 
+def pick_delay(minimum, maximum) -> float:
+    """A delay drawn uniformly from [minimum, maximum] seconds.
+
+    Order does not matter -- the pair is sorted first, so writing the larger
+    number on the MIN line cannot produce a negative delay. A pair that is
+    equal gives a fixed delay; zero gives none.
+    """
+    try:
+        low, high = float(minimum), float(maximum)
+    except (TypeError, ValueError):
+        return 0.0
+    if low > high:
+        low, high = high, low
+    low = max(0.0, low)
+    high = max(0.0, high)
+    if high <= low:
+        return low
+    return random.uniform(low, high)
+
+
+def sleep_between(minimum, maximum, label="") -> None:
+    """Wait for a delay drawn from the configured range."""
+    delay = pick_delay(minimum, maximum)
+    if delay <= 0:
+        return
+    if label:
+        log("      ... %s %.1fs (random %.0f-%.0fs)"
+            % (label, delay, min(minimum, maximum), max(minimum, maximum)))
+    time.sleep(delay)
+
+
 def sleep_jitter(base_seconds, label="") -> None:
-    """A short configured gap, spread slightly so ranks do not synchronise."""
+    """A single gap with jitter.  Kept for the request-pacing path only.
+
+    The three crawl delays use sleep_between() and their own MIN/MAX pairs;
+    this remains for places where one base number is the natural way to say
+    it (the gap between listing pages, which follows the source's own pace).
+    """
     if base_seconds <= 0:
         return
     delay = float(base_seconds) * (1.0 + random.uniform(
@@ -1727,8 +1790,8 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
 
             # Labelled, so the wait before the next job page is visible
             # rather than looking like a hang.
-            sleep_jitter(JOB_GAP_SECONDS,
-                         "next job page in" if SHOW_JOB_TIMER else "")
+            sleep_between(JOB_GAP_MIN_SECONDS, JOB_GAP_MAX_SECONDS,
+                          "next job page in" if SHOW_JOB_TIMER else "")
 
         save_master(pd.DataFrame(existing_data.values()))
 
@@ -1887,7 +1950,9 @@ def run_crawl_cycle(client, state, existing_data) -> str:
                 process_failed_queue(client, existing_data)
 
             if city_index < len(cities):
-                sleep_jitter(CITY_GAP_SECONDS, "next city in")
+                sleep_between(CITY_GAP_MIN_SECONDS,
+                              CITY_GAP_MAX_SECONDS,
+                              "next city in")
 
         keyword_index += 1
         city_index = 0
@@ -1898,7 +1963,9 @@ def run_crawl_cycle(client, state, existing_data) -> str:
         save_crawl_cycle_state(state)
 
         if keyword_index < len(order):
-            sleep_jitter(KEYWORD_GAP_SECONDS, "next keyword in")
+            sleep_between(KEYWORD_GAP_MIN_SECONDS,
+                          KEYWORD_GAP_MAX_SECONDS,
+                          "next keyword in")
 
     return "complete"
 
@@ -1985,6 +2052,22 @@ def install_signal_handlers() -> None:
             signal.signal(sig, handler)
         except (ValueError, OSError):                # pragma: no cover
             pass                                      # not the main thread
+
+
+def client_success_count(client) -> int:
+    """How many requests this client has answered successfully.
+
+    Used to tell a fresh refusal from a continuing one: if this number has
+    moved since the last block, real collection happened in between and the
+    403 escalation starts again at 1x.
+    """
+    return int(getattr(client, "successful_requests", 0) or 0)
+
+
+def describe_escalation() -> str:
+    """e.g. "10m 00s, 20m 00s, 30m 00s, 40m 00s" -- for the log."""
+    return ", ".join(human_duration(ACCESS_BREAK_SECONDS * step)
+                     for step in range(1, max(1, MAX_BLOCK_COOLDOWNS) + 1))
 
 
 def print_startup_banner(cities, plan_pairs, client) -> None:
@@ -2083,6 +2166,7 @@ def main(max_cycles=None, client=None) -> int:
 
     reset_work_timer()
     block_cooldowns = 0
+    block_progress_mark = 0
     cycles_done = 0
 
     while True:
@@ -2160,6 +2244,15 @@ def main(max_cycles=None, client=None) -> int:
             save_master(pd.DataFrame(existing_data.values()))
             client.close()
 
+            # "Consecutive" means with no successful page in between. A
+            # refusal hours after the last one, with collection in between,
+            # starts the escalation again at 1x rather than carrying on from
+            # where a long-gone problem left off.
+            progress_now = client_success_count(client)
+            if progress_now > block_progress_mark:
+                block_cooldowns = 0
+            block_progress_mark = progress_now
+
             block_cooldowns += 1
             if blocked.scope == "session_wide":
                 log("\n" + "=" * 72)
@@ -2183,28 +2276,42 @@ def main(max_cycles=None, client=None) -> int:
                 return 2
 
             if block_cooldowns > MAX_BLOCK_COOLDOWNS:
-                log("\n" + "=" * 72)
-                log("STOPPING. %s persisted through %d cooldown(s)."
-                    % (blocked.label, MAX_BLOCK_COOLDOWNS))
-                log("  last reference : %s" % blocked.reference)
-                log("The checkpoint is INTACT -- cycle %d, keyword %d/%d, "
-                    "city %d/%d, page %d --"
+                # The escalation is spent. The unit was already marked
+                # skipped above, so give up on it and carry on with the rest
+                # of the crawl rather than ending the run.
+                log("\n" + "-" * 72)
+                log("GIVING UP ON THIS UNIT. %s survived all %d escalating "
+                    "cooldowns" % (blocked.label, MAX_BLOCK_COOLDOWNS))
+                log("(%s). The %s is skipped and recorded in %s; the crawl "
+                    "continues with" % (describe_escalation(), blocked.work_type,
+                                        FAILED_PAGES_FILE))
+                log("the next one, from cycle %d, keyword %d/%d, city %d/%d."
                     % (state["crawl_cycle_number"],
                        state["current_keyword_index"] + 1,
                        len(state["keyword_order"]),
-                       state["current_city_index"] + 1, len(state["cities"]),
-                       state["current_page"]))
-                log("so re-running continues from exactly here once access is "
-                    "restored.")
-                log("=" * 72)
-                client.cleanup()
-                return 2
+                       state["current_city_index"] + 1, len(state["cities"])))
+                log("-" * 72 + "\n")
+                record_failed(blocked.work_type, blocked.reference,
+                              "skipped after %d escalating cooldowns"
+                              % MAX_BLOCK_COOLDOWNS,
+                              status=blocked.status,
+                              context=blocked.context,
+                              recovery_status="manual")
+                block_cooldowns = 0
+                block_progress_mark = client_success_count(client)
+                continue
 
-            wait = max(ACCESS_BREAK_SECONDS, int(blocked.wait_seconds or 0))
-            sleep_long(wait, "%s access break %d/%d (checkpoint saved; the "
-                             "next real request tells us whether access is "
-                             "back)" % (blocked.label, block_cooldowns,
-                                        MAX_BLOCK_COOLDOWNS))
+            # The wait grows with each consecutive refusal: 1x, 2x, 3x, 4x.
+            # max(), never min(): a longer Retry-After from the source must
+            # never be shortened by our own schedule.
+            wait = max(ACCESS_BREAK_SECONDS * block_cooldowns,
+                       int(blocked.wait_seconds or 0))
+            sleep_long(wait, "%s access break %d/%d -- %dx the %s base "
+                             "cooldown (checkpoint saved; the next real "
+                             "request tells us whether access is back)"
+                       % (blocked.label, block_cooldowns, MAX_BLOCK_COOLDOWNS,
+                          block_cooldowns,
+                          human_duration(ACCESS_BREAK_SECONDS)))
             continue
 
         except KeyboardInterrupt:

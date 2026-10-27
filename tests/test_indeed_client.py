@@ -430,12 +430,14 @@ class TestPaginationStops(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="indeed-pages-")
         self._saved = {name: getattr(F, name) for name in
                        ("BASE_DIR", "VERBOSE", "REQUEST_GAP_SECONDS",
-                        "JOB_GAP_SECONDS", "NIGHT_PAUSE_ENABLED",
+                        "JOB_GAP_MIN_SECONDS", "JOB_GAP_MAX_SECONDS",
+                        "NIGHT_PAUSE_ENABLED",
                         "LOG_EVERY_ROW", "SHOW_JOB_TIMER")}
         F.BASE_DIR = self.tmp
         F.VERBOSE = False
         F.REQUEST_GAP_SECONDS = 0
-        F.JOB_GAP_SECONDS = 0
+        F.JOB_GAP_MIN_SECONDS = 0
+        F.JOB_GAP_MAX_SECONDS = 0
         F.NIGHT_PAUSE_ENABLED = False
         F.LOG_EVERY_ROW = False
         F.SHOW_JOB_TIMER = False
