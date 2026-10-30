@@ -190,16 +190,16 @@ PACING_JITTER_FRACTION = 0.35   # spreads the ranks apart; not evasion
 #
 # MIN == MAX is allowed and means a fixed delay. MIN > MAX is tolerated (they
 # are swapped), and 0 means no delay at all.
-JOB_GAP_MIN_SECONDS = 10.0      # after each job detail page
-JOB_GAP_MAX_SECONDS = 14.0
-CITY_GAP_MIN_SECONDS = 15.0     # between two cities
-CITY_GAP_MAX_SECONDS = 21.0
-KEYWORD_GAP_MIN_SECONDS = 15.0  # between two keywords
-KEYWORD_GAP_MAX_SECONDS = 21.0
+JOB_GAP_MIN_SECONDS = 20.0      # after each job detail page
+JOB_GAP_MAX_SECONDS = 30.0
+CITY_GAP_MIN_SECONDS = 2000.0     # between two cities
+CITY_GAP_MAX_SECONDS = 4000.0
+KEYWORD_GAP_MIN_SECONDS = 3000.0  # between two keywords
+KEYWORD_GAP_MAX_SECONDS = 6000.0
 
 # -- HTTP timeout settings --------------------------------------------------
-HTTP_CONNECT_TIMEOUT_SECONDS = 10
-HTTP_READ_TIMEOUT_SECONDS = 30
+HTTP_CONNECT_TIMEOUT_SECONDS = 20
+HTTP_READ_TIMEOUT_SECONDS = 40
 HTTP_USER_AGENT = "JobEasyIndia-IndeedCollector/1.0"
 
 # -- Retry configuration ----------------------------------------------------
