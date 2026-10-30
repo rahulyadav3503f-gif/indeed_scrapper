@@ -277,8 +277,14 @@ PACING_JITTER_FRACTION = 0.35   # spreads the ranks apart; not evasion
 #   0   -> no cap; only the gaps below apply
 MAX_JOBS_PER_HOUR = 3
 
-JOB_GAP_MIN_SECONDS = 20.0      # after each job detail page
-JOB_GAP_MAX_SECONDS = 30.0
+# After EACH job card, a fresh random wait between these two values.
+# 5 to 10 minutes. In listing-only mode no request is made for a card, so
+# this does not slow any request down directly -- what it actually does is
+# push the NEXT LISTING PAGE request far into the future: 16 cards at 5-10
+# minutes each puts page 2 roughly 80 to 160 minutes after page 1, instead
+# of the 7 seconds that got it refused.
+JOB_GAP_MIN_SECONDS = 300.0     # 5 minutes
+JOB_GAP_MAX_SECONDS = 600.0     # 10 minutes
 # With MAX_JOBS_PER_HOUR doing the pacing, these only need to space the
 # LISTING requests out; they must stay BELOW the cap's own spacing (3/hour =
 # one job every ~20 min) or they, not the cap, become the binding constraint
@@ -2090,14 +2096,15 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
 
             # Labelled, so the wait before the next job page is visible
             # rather than looking like a hang.
-            if COLLECT_JOB_DETAILS:
+            # The gap applies in BOTH modes. It was briefly skipped in
+            # listing-only mode on the grounds that a card costs no request
+            # -- true, but it misses the point: the wait is what spaces out
+            # the listing page requests, which are the ones being refused.
+            # The last card of a page is not waited on; the city and keyword
+            # delays take over there.
+            if job_index < len(jobs):
                 sleep_between(JOB_GAP_MIN_SECONDS, JOB_GAP_MAX_SECONDS,
-                              "next job page in" if SHOW_JOB_TIMER else "")
-            elif job_index < len(jobs):
-                # Nothing is being fetched between cards, so the long
-                # between-pages gap would only idle. A short beat keeps the
-                # log readable and the window watchable.
-                sleep_between(0.2, 0.6, "")
+                              "next job card in" if SHOW_JOB_TIMER else "")
 
         save_master(pd.DataFrame(existing_data.values()))
 
@@ -2129,6 +2136,28 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
 
         if pages_planned is not None and page_number > pages_planned:
             break
+
+        # DON'T SPEND A REQUEST ON A PAGE THAT CANNOT HOLD ANYTHING NEW.
+        #
+        # The site paginates in steps of INDEED_PAGE_STEP (10) but a page
+        # DISPLAYS more than that -- 16 cards is typical. So a search the
+        # header reports as 16 results is "2 pages" by the step, while page
+        # 1 already showed all 16. The old code requested page 2 anyway,
+        # got back the same cards, and STOP_ON_PAGE_WITH_NO_NEW_JOBS then
+        # noticed. That is one wasted request per combo, and a wasted
+        # request is what triggers a refusal and the 10-minute cooldown
+        # after it.
+        #
+        # Counting what actually arrived is the honest check: once the cards
+        # in hand cover the reported total, the results are exhausted.
+        if total and len(seen_in_combo) >= int(total):
+            log("     page %d already held all %s reported result(s) -- "
+                "no page %d request needed"
+                % (page_number - 1, "{:,}".format(total), page_number))
+            state["current_page"] = 1
+            state["done_job_urls"] = []
+            save_crawl_cycle_state(state)
+            return saved_here
 
     state["current_page"] = 1
     state["done_job_urls"] = []

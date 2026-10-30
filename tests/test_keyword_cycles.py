@@ -233,3 +233,116 @@ class TestCycleProgression(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestNoWastedListingRequest(unittest.TestCase):
+    """A page that cannot hold anything new must not be requested.
+
+    The site paginates in steps of 10 but shows ~16 cards, so a search the
+    header calls "16 results" is two pages by the step while page 1 already
+    showed all 16. Requesting page 2 returned the same cards -- one wasted
+    request per combo, and a wasted request is what earns a 403 and the
+    10-minute cooldown behind it.
+    """
+
+    def setUp(self):
+        self.requested = []
+        self._saved = {name: getattr(F, name) for name in
+                       ("JOB_GAP_MIN_SECONDS", "JOB_GAP_MAX_SECONDS",
+                        "MAX_JOBS_PER_HOUR", "COLLECT_JOB_DETAILS",
+                        "CITY_GAP_MIN_SECONDS", "CITY_GAP_MAX_SECONDS")}
+        F.JOB_GAP_MIN_SECONDS = 0.0
+        F.JOB_GAP_MAX_SECONDS = 0.0
+        F.CITY_GAP_MIN_SECONDS = 0.0
+        F.CITY_GAP_MAX_SECONDS = 0.0
+        F.MAX_JOBS_PER_HOUR = 0
+        F.COLLECT_JOB_DETAILS = False
+        F._JOB_READ_TIMES = []
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            setattr(F, name, value)
+
+    def client(self, total, cards_on_page_one):
+        requested = self.requested
+
+        class CountingClient:
+            def search_jobs(self, keyword, city, page):
+                requested.append(page)
+                if page == 1:
+                    return ([{"job_key": "k%d" % i,
+                              "title": "Server Administrator",
+                              "company_name": "Acme",
+                              "formatted_location": "Delhi",
+                              "source_url": "https://in.indeed.com/viewjob?jk=k%d" % i}
+                             for i in range(cards_on_page_one)], total)
+                raise AssertionError("page %d must not be requested" % page)
+
+            def page_count(self, total, cap=None, minimum=None):
+                step = F.INDEED_PAGE_STEP
+                pages = (int(total) + step - 1) // step if total else 1
+                return max(minimum or 1, min(pages, cap or pages))
+
+        return CountingClient()
+
+    def run_one_combo(self, total, cards):
+        state = {"current_page": 1, "done_job_urls": []}
+        saved_rows = []
+        real_append = F.append_detail_to_excel
+        real_master = F.save_master
+        real_checkpoint = F.save_crawl_cycle_state
+        try:
+            F.append_detail_to_excel = lambda row, **kw: saved_rows.append(row) or row
+            F.save_master = lambda frame: None
+            F.save_crawl_cycle_state = lambda s: None
+            F.run_combo(self.client(total, cards), state, "IT Department",
+                        "Server Administrator", "Delhi", {})
+        finally:
+            F.append_detail_to_excel = real_append
+            F.save_master = real_master
+            F.save_crawl_cycle_state = real_checkpoint
+        return saved_rows
+
+    def test_page_two_is_not_requested_when_page_one_held_everything(self):
+        """16 reported, 16 arrived -> exactly one request."""
+        self.run_one_combo(total=16, cards=16)
+        self.assertEqual(self.requested, [1],
+                         "requested pages %s; page 1 already had all 16"
+                         % self.requested)
+
+    def test_page_two_IS_requested_when_results_remain(self):
+        """40 reported, 16 arrived -> page 2 is real, so it must be asked for."""
+        class TwoPageClient:
+            def __init__(self, log):
+                self.log = log
+
+            def search_jobs(self, keyword, city, page):
+                self.log.append(page)
+                start = (page - 1) * 16
+                return ([{"job_key": "k%d" % (start + i),
+                          "title": "Server Administrator",
+                          "company_name": "Acme",
+                          "formatted_location": "Delhi",
+                          "source_url": "https://in.indeed.com/viewjob?jk=k%d"
+                                        % (start + i)}
+                         for i in range(16)], 40)
+
+            def page_count(self, total, cap=None, minimum=None):
+                return min(cap or 3, 4)
+
+        state = {"current_page": 1, "done_job_urls": []}
+        real_append = F.append_detail_to_excel
+        real_master = F.save_master
+        real_checkpoint = F.save_crawl_cycle_state
+        try:
+            F.append_detail_to_excel = lambda row, **kw: row
+            F.save_master = lambda frame: None
+            F.save_crawl_cycle_state = lambda s: None
+            F.run_combo(TwoPageClient(self.requested), state, "IT Department",
+                        "Server Administrator", "Delhi", {})
+        finally:
+            F.append_detail_to_excel = real_append
+            F.save_master = real_master
+            F.save_crawl_cycle_state = real_checkpoint
+        self.assertGreater(len(self.requested), 1,
+                           "page 2 holds real results and must be requested")

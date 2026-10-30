@@ -696,6 +696,94 @@ signed-out collection is **one listing page per browser run**, around 16
 jobs, and the route to volume is a licensed feed through the `HttpTransport`
 that is already built and tested.
 
+## 6h. Why only one listing page, and a wasted request that caused it
+
+### What the log actually said
+
+```
+16 job(s) reported -> 2 page(s) to crawl (floor 1, cap 3)
+page 1: 16 listing(s) (16 new)
+...
+page 1 done: 16 job(s) in 7s (15 saved so far for this city)
+[BROWSER] opening .../jobs?q=Server+Administrator&l=Delhi&start=10&sort=date
+ 📌 queued for a later retry (access denied: HTTP 403 ...): Server Administrator|Delhi|p2
+```
+
+Two separate things, easy to conflate:
+
+1. **This search only had two pages to begin with.** The header reported 16
+   results. `MAX_LISTING_PAGES = 3` was never the limit -- the result count
+   was. Different keyword-and-city pairs report thousands and do plan three.
+2. **Page 2 was refused.** That is the 403 documented in §6e-§6g: the
+   second request from a browser gets refused regardless of pacing, query
+   or account.
+
+### The wasted request
+
+Worse: **page 2 could not have contained anything new.** The header said 16
+results and page 1 displayed all 16 of them. The site paginates in steps of
+`INDEED_PAGE_STEP = 10` while a page SHOWS about 16 cards, so
+`page_count(16, step=10)` plans two pages -- and `start=10` would return
+cards 11 to 16, every one of them already collected.
+
+The old code requested it anyway and let `STOP_ON_PAGE_WITH_NO_NEW_JOBS`
+notice afterwards. That is one wasted request per combo, and on this site a
+wasted request is exactly what earns the 403 and the ten-minute cooldown
+sitting behind it.
+
+`run_combo()` now counts what actually arrived rather than trusting the
+step:
+
+```python
+if total and len(seen_in_combo) >= int(total):
+    log("     page %d already held all %s reported result(s) -- "
+        "no page %d request needed" % ...)
+```
+
+```
+before:  page 1 (16 cards)  ->  request page 2  ->  403  ->  10 min cooldown
+after :  page 1 (16 cards)  ->  no request      ->  next city
+```
+
+Two tests in `tests/test_keyword_cycles.py` hold the line in both
+directions: with 16 reported and 16 arrived, exactly one request is made;
+with 40 reported and 16 arrived, page 2 IS requested, because it holds real
+results. The second test matters more than the first -- an over-eager stop
+would silently halve the collection.
+
+### The job-card gap is now 5 to 10 minutes
+
+```python
+JOB_GAP_MIN_SECONDS = 300.0     # 5 minutes
+JOB_GAP_MAX_SECONDS = 600.0     # 10 minutes
+```
+
+Drawn fresh per card, so 2000 draws average 7.4 minutes across the full
+5-to-10 range.
+
+The gap also applies in listing-only mode again. It had been skipped there,
+reasoning that a card costs no request -- true, but beside the point. The
+wait is what spaces out the **listing page** requests, which are the ones
+being refused:
+
+```
+15 cards of waiting -> page 2 arrives 75 to 150 minutes after page 1,
+                       instead of the 7 seconds that got it refused
+```
+
+Whether that interval is long enough is **not established**. A 7-minute gap
+was measured and still refused (§6g); 75 minutes has not been tested, and
+the evidence so far points at `navigator.webdriver` rather than timing, so
+it may well make no difference to the 403.
+
+The last card of a page is not waited on -- the city and keyword delays
+take over at that boundary, so the two do not stack.
+
+`MAX_JOBS_PER_HOUR = 3` stays inactive in listing-only mode. At 5-10
+minutes a card the run already collects about 8 an hour, and a 3-per-hour
+request cap would force 20 minutes between cards, overriding the 5-to-10
+that was asked for.
+
 ## 7. Two unrelated defects found while measuring
 
 **`BrowserTransport.kill()` was too broad.** The immediate-stop path (Ctrl+C)
