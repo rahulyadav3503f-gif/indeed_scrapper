@@ -48,6 +48,8 @@ class ErrorTestCase(unittest.TestCase):
         self._saved = {name: getattr(F, name) for name in
                        ("BASE_DIR", "VERBOSE", "REQUEST_GAP_SECONDS",
                         "JOB_GAP_MIN_SECONDS", "JOB_GAP_MAX_SECONDS",
+                        "LISTING_PAGE_GAP_MIN_SECONDS",
+                        "LISTING_PAGE_GAP_MAX_SECONDS",
                         "CITY_GAP_MIN_SECONDS", "CITY_GAP_MAX_SECONDS",
                         "KEYWORD_GAP_MIN_SECONDS",
                         "KEYWORD_GAP_MAX_SECONDS", "NIGHT_PAUSE_ENABLED",
@@ -56,6 +58,8 @@ class ErrorTestCase(unittest.TestCase):
         F.VERBOSE = False
         F.REQUEST_GAP_SECONDS = 0
         F.JOB_GAP_MIN_SECONDS = 0
+        F.LISTING_PAGE_GAP_MIN_SECONDS = 0
+        F.LISTING_PAGE_GAP_MAX_SECONDS = 0
         F.JOB_GAP_MAX_SECONDS = 0
         F.CITY_GAP_MIN_SECONDS = 0
         F.CITY_GAP_MAX_SECONDS = 0

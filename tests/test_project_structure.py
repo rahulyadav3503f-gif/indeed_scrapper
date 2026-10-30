@@ -36,6 +36,7 @@ REQUIRED_SETTINGS = [
     "KEYWORD_SHUFFLE_ENABLED",
     "DETAIL_OUTPUT_FILE", "MASTER_OUTPUT_FILE", "EXCEL_BATCH_SIZE",
     "CYCLE_COOLDOWN_MINUTES",
+    "TARGET_UNIQUE_JOBS",
     "MIN_LISTING_PAGES", "MAX_LISTING_PAGES", "RESULTS_PER_PAGE",
     "MAX_JOBS_PER_HOUR", "MAX_LOGIN_REQUIRED_SKIPS",
     "STOP_ON_PAGE_WITH_NO_NEW_JOBS",
@@ -43,6 +44,7 @@ REQUIRED_SETTINGS = [
     "WORK_PERIOD_MIN_HOURS", "WORK_PERIOD_MAX_HOURS",
     "REQUEST_GAP_SECONDS",
     "JOB_GAP_MIN_SECONDS", "JOB_GAP_MAX_SECONDS",
+    "LISTING_PAGE_GAP_MIN_SECONDS", "LISTING_PAGE_GAP_MAX_SECONDS",
     "CITY_GAP_MIN_SECONDS", "CITY_GAP_MAX_SECONDS",
     "KEYWORD_GAP_MIN_SECONDS", "KEYWORD_GAP_MAX_SECONDS",
     "HTTP_CONNECT_TIMEOUT_SECONDS", "HTTP_READ_TIMEOUT_SECONDS",
@@ -454,3 +456,103 @@ class TestDocumentation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestEveryDelayIsNeutralisedInTests(unittest.TestCase):
+    """A new delay must not be able to silently hang the suite.
+
+    Four test harnesses zero the pacing delays by NAME. Adding
+    LISTING_PAGE_GAP_* left all four unaware of it, and because the gap is
+    5-10 minutes the suite stopped finishing instead of failing -- the worst
+    kind of breakage, because it looks like a hang rather than a bug.
+
+    This walks the config for every delay-shaped setting and asserts each
+    harness neutralises it.
+    """
+
+    HARNESSES = ("test_keyword_cycles.py", "test_checkpoint_recovery.py",
+                 "test_indeed_client.py", "test_error_handling.py")
+
+    def delay_settings(self):
+        """Every *_GAP_MIN/MAX_SECONDS assigned at the top of the script."""
+        path = os.path.join(PROJECT_ROOT, "find_indeed_job.py")
+        with open(path, encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        names = set()
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) \
+                        and re.match(r"^[A-Z_]+_GAP_(MIN|MAX)_SECONDS$",
+                                     target.id):
+                    names.add(target.id)
+        return names
+
+    def test_the_delays_are_the_ones_we_think(self):
+        found = self.delay_settings()
+        self.assertIn("JOB_GAP_MIN_SECONDS", found)
+        self.assertIn("LISTING_PAGE_GAP_MIN_SECONDS", found)
+        self.assertIn("CITY_GAP_MIN_SECONDS", found)
+        self.assertIn("KEYWORD_GAP_MIN_SECONDS", found)
+
+    def test_every_harness_neutralises_every_delay(self):
+        delays = self.delay_settings()
+        self.assertTrue(delays, "no delay settings found at all")
+        for harness in self.HARNESSES:
+            path = os.path.join(PROJECT_ROOT, "tests", harness)
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+            missing = sorted(name for name in delays if name not in text)
+            self.assertEqual(
+                missing, [],
+                "%s does not neutralise %s -- a real %s delay would make "
+                "the suite hang rather than fail"
+                % (harness, ", ".join(missing), missing[0] if missing else ""))
+
+
+class TestTestsNeverWriteProductionState(unittest.TestCase):
+    """A test that drives run_combo() must redirect BASE_DIR.
+
+    The checkpoint path is resolved against BASE_DIR at WRITE time, so a
+    test class that calls run_combo() without redirecting it writes the
+    real crawl_cycle_state.json in the project root. That happened once and
+    only showed up as a changed mtime, which is exactly the kind of damage
+    a test suite must not be able to do.
+    """
+
+    def test_classes_driving_run_combo_redirect_base_dir(self):
+        offenders = []
+        tests_dir = os.path.join(PROJECT_ROOT, "tests")
+        for name in sorted(os.listdir(tests_dir)):
+            if not name.startswith("test_") or not name.endswith(".py"):
+                continue
+            with open(os.path.join(tests_dir, name), encoding="utf-8") as handle:
+                source = handle.read()
+            if "run_combo" not in source and "run_crawl_cycle" not in source:
+                continue
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                body = ast.get_source_segment(source, node) or ""
+                drives = "run_combo(" in body or "run_crawl_cycle(" in body
+                if not drives:
+                    continue
+                # The class is safe if it redirects BASE_DIR itself, or
+                # delegates to something in the same file that does -- a
+                # base class, or a helper such as TempProject.
+                redirectors = {
+                    other.name for other in ast.walk(tree)
+                    if isinstance(other, ast.ClassDef)
+                    and other is not node
+                    and "BASE_DIR" in (
+                        ast.get_source_segment(source, other) or "")}
+                delegates = any(helper in body for helper in redirectors)
+                if "BASE_DIR" not in body and not delegates:
+                    offenders.append("%s::%s" % (name, node.name))
+        self.assertEqual(
+            offenders, [],
+            "these test classes drive the crawl without redirecting "
+            "BASE_DIR, so they write the real checkpoint: %s"
+            % ", ".join(offenders))

@@ -784,6 +784,152 @@ minutes a card the run already collects about 8 an hour, and a 3-per-hour
 request cap would force 20 minutes between cards, overriding the 5-to-10
 that was asked for.
 
+## 6i. A unique-job target, and a dedicated listing-page delay
+
+### Configuration
+
+```python
+TARGET_UNIQUE_JOBS = 100          # distinct jobs to aim for per combo
+
+MIN_LISTING_PAGES = 1             # pages before "nothing new" may stop it
+MAX_LISTING_PAGES = 30            # hard safety ceiling on requests
+
+LISTING_PAGE_GAP_MIN_SECONDS = 300.0    # between listing pages
+LISTING_PAGE_GAP_MAX_SECONDS = 600.0
+
+JOB_GAP_MIN_SECONDS = 300.0             # between job cards (unchanged)
+JOB_GAP_MAX_SECONDS = 600.0
+```
+
+The target and the ceiling are independent: whichever applies first ends
+the combo. A test asserts the ceiling can actually reach the target at the
+pagination step, so `MAX_LISTING_PAGES = 5` with a target of 100 fails
+loudly instead of quietly collecting 50.
+
+### Why the reported total had to stop deciding anything
+
+§6h added an early stop: once the cards in hand covered the total the page
+reported, no further request was made. It saved one request per exhausted
+combo and it was wrong, because the total cannot be trusted:
+
+```python
+self._read_total(self.page, len(jobs))      # fallback = the CARD COUNT
+```
+
+When no results-header selector matches, the client falls back to the
+number of cards on the page. That is why a run logged "16 job(s) reported"
+for a search whose own page title read **"200 Cloud Administrator Job
+Vacancies in Delhi"**. Any rule built on that number abandons a
+200-result search after one page.
+
+The reported total is now logged as **advisory only** and terminates
+nothing. The honest end-of-results signal is a page that brings no new
+identity, which costs one extra request and cannot be fooled by a bad
+header. Both directions are tested.
+
+### Counting distinct jobs
+
+`job_identity()` prefers Indeed's own `job_key`, falls back to the `jk`
+carried in the job page url, and returns `""` for a card with neither --
+deliberately, because a synthetic identity would inflate the unique count
+and two unidentifiable cards cannot be told apart anyway. Unidentified
+cards are reported separately and not counted:
+
+```
+[PAGE 2]
+Cards found: 16
+New unique jobs: 10
+Duplicate jobs: 6
+Total unique jobs: 26/100
+```
+
+A card repeated from an earlier page is also no longer re-processed. The
+Excel writer would have rejected it as a duplicate, but only after a full
+extract and a full read of the working file.
+
+### Unique progress survives a restart
+
+The tracked identities used to live only in memory, so a run resuming at
+page 6 restarted its count from zero and paginated far past the target.
+They are now checkpointed next to the page number, keyed by the combo they
+belong to:
+
+```json
+"combo_signature": "Python Developer||Pune",
+"seen_job_ids": ["jk0001", "jk0002", ...]
+```
+
+A checkpoint written for a different combo, or by an older version with no
+such field, yields an empty set rather than a wrong count. The list is
+capped at `MAX_TRACKED_JOB_IDS = 5000` so the file cannot grow without
+bound, and it is cleared when the combo finishes so the next combo cannot
+inherit it.
+
+### The page delay, and how it stacks
+
+Drawn fresh at every transition and paid **before** the next page is
+opened, never after a stop. Measured across ten pages:
+
+```
+7m 23s, 7m 09s, 7m 35s, 9m 53s, 9m 23s, 5m 49s, 8m 40s, 7m 07s, 9m 10s
+all within 5-10 min: True        all different: True
+```
+
+It does **not** replace the per-card gap, and the two stack. With 16 cards
+a page:
+
+```
+15 card gaps (75-150 min) + 1 page gap (5-10 min)
+  -> a page transition lands 80 to 160 minutes after the previous page
+```
+
+Set `JOB_GAP_*` to 0 for the page gap to govern the pace alone.
+
+**This is pacing, not a fix for HTTP 403.** A 7-minute gap was measured
+against the live site in §6g and the next page was still refused. 80
+minutes is untested.
+
+### Stop reasons are reported verbatim
+
+`TARGET REACHED`, `EMPTY PAGE`, `NO NEW JOBS`, `MAX PAGE LIMIT`,
+`ACCESS DENIED`, `PAGE UNAVAILABLE`. Only the first prints "target
+achieved"; every other prints "target NOT reached" with the count that was
+actually reached.
+
+### Access refusals
+
+Unchanged in policy, strengthened in bookkeeping. On a 403 the exact url,
+keyword, city and page are recorded with `recovery_status="manual"`, the
+unique-job progress is checkpointed **before** the exception propagates,
+and `current_page` is deliberately NOT advanced here -- the AccessBlocked
+handler owns that decision, resuming at the next page for an isolated
+refusal so the refused one is not asked for again. No further page is
+requested after a refusal: a test asserts pagination does not treat page 3
+as a route around a refused page 2.
+
+### Two defects found while implementing this
+
+**A ten-minute delay could not be interrupted.** `sleep_between()` used a
+bare `time.sleep()`. With the gaps now measured in minutes, `./indeed stop`
+went unnoticed until the sleep finished and the launcher sent SIGKILL at
+120s -- the same defect fixed in `sleep_long()` in §6e, in a second place.
+Both now go through `sleep_responsive()`, which wakes every three seconds.
+
+**The test suite could write production state.** Four harnesses neutralise
+the pacing delays *by name*, so adding `LISTING_PAGE_GAP_*` left all four
+unaware of it -- and because the gap is 5-10 minutes the suite stopped
+finishing instead of failing. Worse, a new test class drove `run_combo()`
+without redirecting `BASE_DIR`, and since the checkpoint path is resolved
+at write time it wrote the real `crawl_cycle_state.json`. Only `updated_at`
+differed and the file was restored from a pre-change copy, but a suite must
+not be able to do that at all.
+
+Two structural guards now prevent both: one walks the config for every
+`*_GAP_MIN/MAX_SECONDS` and asserts each harness neutralises it (it
+immediately found that `test_indeed_client.py` had never neutralised the
+city and keyword gaps), and one asserts every test class driving the crawl
+redirects `BASE_DIR`, directly or through a helper.
+
 ## 7. Two unrelated defects found while measuring
 
 **`BrowserTransport.kill()` was too broad.** The immediate-stop path (Ctrl+C)

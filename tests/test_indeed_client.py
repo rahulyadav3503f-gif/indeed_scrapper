@@ -450,6 +450,10 @@ class TestPaginationStops(unittest.TestCase):
         self._saved = {name: getattr(F, name) for name in
                        ("BASE_DIR", "VERBOSE", "REQUEST_GAP_SECONDS",
                         "JOB_GAP_MIN_SECONDS", "JOB_GAP_MAX_SECONDS",
+                        "LISTING_PAGE_GAP_MIN_SECONDS",
+                        "LISTING_PAGE_GAP_MAX_SECONDS",
+                        "CITY_GAP_MIN_SECONDS", "CITY_GAP_MAX_SECONDS",
+                        "KEYWORD_GAP_MIN_SECONDS", "KEYWORD_GAP_MAX_SECONDS",
                         "NIGHT_PAUSE_ENABLED",
                         "MAX_JOBS_PER_HOUR",
                         "LOG_EVERY_ROW", "SHOW_JOB_TIMER")}
@@ -457,7 +461,13 @@ class TestPaginationStops(unittest.TestCase):
         F.VERBOSE = False
         F.REQUEST_GAP_SECONDS = 0
         F.JOB_GAP_MIN_SECONDS = 0
+        F.LISTING_PAGE_GAP_MIN_SECONDS = 0
+        F.LISTING_PAGE_GAP_MAX_SECONDS = 0
         F.JOB_GAP_MAX_SECONDS = 0
+        F.CITY_GAP_MIN_SECONDS = 0
+        F.CITY_GAP_MAX_SECONDS = 0
+        F.KEYWORD_GAP_MIN_SECONDS = 0
+        F.KEYWORD_GAP_MAX_SECONDS = 0
         F.NIGHT_PAUSE_ENABLED = False
         F.MAX_JOBS_PER_HOUR = 0        # no rate cap in tests
         F._JOB_READ_TIMES.clear()
@@ -504,20 +514,32 @@ class TestPaginationStops(unittest.TestCase):
                 return {"jobs": jobs, "total": header}
         return Pages()
 
-    def test_an_under_reporting_header_no_longer_stops_at_two_pages(self):
-        """16 jobs / 10 per page used to mean two pages and a new city.
+    def test_an_under_reporting_header_does_not_stop_pagination(self):
+        """A header of 16 must not end a search that has eight real pages.
 
-        Derived from the configured floor and ceiling rather than pinned:
-        both are tunables, and MAX_LISTING_PAGES was lowered to 3 when the
-        hourly job cap came in.
+        Pagination is driven by TARGET_UNIQUE_JOBS, not by the reported
+        total -- which is unreliable, because the client falls back to the
+        card count when no results header matches. With 3 jobs per page and
+        8 real pages there are only 24 unique jobs, well under the target,
+        so every real page is crawled and the first empty one ends it.
         """
         real_pages = 8
         saved, asked = self.crawl(self.pages_transport(real_pages, header=16))
-        expected = min(max(F.MIN_LISTING_PAGES, 2), F.MAX_LISTING_PAGES,
-                       real_pages)
+        expected = min(real_pages + 1, F.MAX_LISTING_PAGES)
         self.assertEqual(asked, list(range(1, expected + 1)),
-                         "the floor/ceiling were not honoured")
-        self.assertEqual(saved, 3 * expected)
+                         "pagination did not follow the target")
+        self.assertEqual(saved, 3 * min(real_pages, F.MAX_LISTING_PAGES))
+
+    def test_the_page_ceiling_still_bounds_it(self):
+        """The ceiling is independent of the target and applies first."""
+        saved_ceiling = F.MAX_LISTING_PAGES
+        try:
+            F.MAX_LISTING_PAGES = 3
+            _, asked = self.crawl(self.pages_transport(20, header=0))
+            self.assertEqual(asked, [1, 2, 3],
+                             "the ceiling was not honoured: %s" % asked)
+        finally:
+            F.MAX_LISTING_PAGES = saved_ceiling
 
     def test_an_empty_page_stops_it_at_once(self):
         saved, asked = self.crawl(self.pages_transport(1, header=16))

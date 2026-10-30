@@ -186,8 +186,28 @@ CYCLE_COOLDOWN_MINUTES = 45    # rest between finished crawl cycles
 # Under a 3-jobs-an-hour cap a deep ceiling is pointless anyway: ONE listing
 # page of ~16 cards is already five hours of work. So the ceiling is low on
 # purpose; raise it only if the cap is raised with it.
-MIN_LISTING_PAGES = 1           # the header count decides, from page 1 up
-MAX_LISTING_PAGES = 3           # ceiling, per (keyword, city) pair
+# HOW MANY UNIQUE JOBS TO AIM FOR PER (KEYWORD, CITY) PAIR
+# Pagination is driven by this, not by the result count the page claims.
+# It is a TARGET, not a promise: a search with 40 jobs in it stops at 40.
+#
+# It counts DISTINCT JOB IDENTITIES seen in the listings. It is not a number
+# of requests, not a number of pages, not Indeed's reported total, not a
+# number of Excel rows, and not the number of rows accepted -- a card that
+# is filtered out as non-IT still counts as a unique job that was seen.
+#
+# Finishing the page that crosses the line is fine: 106 is a correct result
+# for a target of 100. Valid jobs are never discarded for exceeding it.
+TARGET_UNIQUE_JOBS = 100
+
+# MIN_LISTING_PAGES  attempt at least this many pages before the
+#                    "this page brought nothing new" rule may end a combo.
+#                    1 means the rule can apply from page 2 onwards.
+# MAX_LISTING_PAGES  a hard safety ceiling on requests per combo. It is
+#                    INDEPENDENT of the target: whichever applies first
+#                    wins. 100 unique jobs at a step of 10 needs about 10
+#                    pages, so 30 leaves room for duplicate-heavy results.
+MIN_LISTING_PAGES = 1
+MAX_LISTING_PAGES = 30
 # The site's PAGINATION STEP, not the number of cards you can see. "start="
 # advances by INDEED_PAGE_STEP (10), while a page displays ~16 cards, so
 # consecutive pages overlap -- which is exactly why
@@ -283,8 +303,23 @@ MAX_JOBS_PER_HOUR = 3
 # push the NEXT LISTING PAGE request far into the future: 16 cards at 5-10
 # minutes each puts page 2 roughly 80 to 160 minutes after page 1, instead
 # of the 7 seconds that got it refused.
-JOB_GAP_MIN_SECONDS = 300.0     # 5 minutes
-JOB_GAP_MAX_SECONDS = 600.0     # 10 minutes
+JOB_GAP_MIN_SECONDS = 60.0     # 5 minutes
+JOB_GAP_MAX_SECONDS = 120.0     # 10 minutes
+
+# BETWEEN LISTING PAGES -- a separate, independently configurable gap.
+# Drawn fresh at every page transition, and applied BEFORE the next listing
+# page is opened, never while the current one is being read.
+#
+# It does NOT replace the per-card gap above and the two DO stack. With 16
+# cards a page that is 15 card gaps (75-150 min) plus one page gap (5-10
+# min), so a page transition lands 80 to 160 minutes after the previous
+# page was opened. Set the card gap to 0 if you want the page gap alone to
+# govern the pace.
+#
+# This is a pacing control. It is NOT a fix for HTTP 403: a 7-minute gap
+# was measured against the live site and the next page was still refused.
+LISTING_PAGE_GAP_MIN_SECONDS = 300.0    # 5 minutes
+LISTING_PAGE_GAP_MAX_SECONDS = 600.0    # 10 minutes
 # With MAX_JOBS_PER_HOUR doing the pacing, these only need to space the
 # LISTING requests out; they must stay BELOW the cap's own spacing (3/hour =
 # one job every ~20 min) or they, not the cap, become the binding constraint
@@ -1329,15 +1364,35 @@ def pick_delay(minimum, maximum) -> float:
     return random.uniform(low, high)
 
 
+def sleep_responsive(seconds) -> None:
+    """time.sleep() that notices a shutdown within a few seconds.
+
+    The crawl delays are now minutes long (5-10 between job cards, the same
+    between listing pages). A bare time.sleep() of ten minutes meant
+    "./indeed stop" went unnoticed until it finished, and the launcher sent
+    SIGKILL at 120s -- the same defect that was fixed in sleep_long().
+    """
+    deadline = time.monotonic() + float(seconds)
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return
+        if _SHUTDOWN_REQUESTED:
+            raise KeyboardInterrupt("shutdown requested during a delay")
+        time.sleep(min(3.0, left))
+
+
 def sleep_between(minimum, maximum, label="") -> None:
-    """Wait for a delay drawn from the configured range."""
+    """Wait for a delay drawn fresh from the configured range."""
     delay = pick_delay(minimum, maximum)
     if delay <= 0:
         return
     if label:
-        log("      ... %s %.1fs (random %.0f-%.0fs)"
-            % (label, delay, min(minimum, maximum), max(minimum, maximum)))
-    time.sleep(delay)
+        log("      ... %s %s (random %s-%s)"
+            % (label, human_duration(delay),
+               human_duration(min(minimum, maximum)),
+               human_duration(max(minimum, maximum))))
+    sleep_responsive(delay)
 
 
 def sleep_jitter(base_seconds, label="") -> None:
@@ -1918,6 +1973,105 @@ def process_job(client, raw_job, input_row):
     return "saved"
 
 
+# ---------------------------------------------------------------------------
+# UNIQUE-JOB TRACKING, ACROSS A RESTART
+# ---------------------------------------------------------------------------
+# The target counts DISTINCT jobs, and Indeed repeats cards across pages, so
+# the count is only correct if the identities are remembered. Held in memory
+# alone it was lost on restart: a run resuming at page 6 would start again
+# from zero and keep paginating long past the target.
+#
+# The identities are therefore checkpointed alongside the page number, keyed
+# by the combo they belong to, so resuming the SAME (keyword, city) restores
+# the progress while moving to a new combo starts clean.
+
+# Stop reasons, reported verbatim so the log never claims a target was hit
+# when something else ended the combo.
+STOP_TARGET_REACHED = "TARGET REACHED"
+STOP_EMPTY_PAGE = "EMPTY PAGE"
+STOP_NO_NEW_JOBS = "NO NEW JOBS"
+STOP_MAX_PAGE_LIMIT = "MAX PAGE LIMIT"
+STOP_ACCESS_DENIED = "ACCESS DENIED"
+STOP_PAGE_UNAVAILABLE = "PAGE UNAVAILABLE"
+
+# A cap on what is written to the checkpoint, so a pathological combo cannot
+# grow crawl_cycle_state.json without bound. Well above any realistic
+# target; if it is ever hit the count stays correct for everything retained.
+MAX_TRACKED_JOB_IDS = 5000
+
+
+def job_identity(job) -> str:
+    """The stable identity of one listing card, or "" if it has none.
+
+    Indeed's own job key is preferred -- it is the same string on every page
+    the card appears on. The job page url carries that key, so it is an
+    equally good fallback. A card with neither is NOT given a synthetic
+    identity: counting it would inflate the unique total, and two such cards
+    cannot be told apart anyway.
+    """
+    if not isinstance(job, dict):
+        return ""
+    key = clean_value(job.get("job_key"))
+    if key:
+        return key
+    url = clean_value(job.get("source_url")) or clean_value(
+        job.get("detail_page_url"))
+    if url:
+        match = re.search(r"[?&](?:jk|vjk)=([A-Za-z0-9_-]+)", url)
+        return match.group(1) if match else url
+    return ""
+
+
+def combo_signature(keyword, city) -> str:
+    """Identifies the (keyword, city) pair the tracked identities belong to."""
+    return "%s||%s" % (clean_value(keyword), clean_value(city))
+
+
+def load_seen_for_combo(state, signature) -> set:
+    """The identities already seen for THIS combo, from the checkpoint.
+
+    A checkpoint written for a different combo (or by an older version that
+    stored none) yields an empty set rather than a wrong count.
+    """
+    if not isinstance(state, dict):
+        return set()
+    if clean_value(state.get("combo_signature")) != signature:
+        return set()
+    stored = state.get("seen_job_ids")
+    if not isinstance(stored, (list, tuple, set)):
+        return set()
+    return {clean_value(item) for item in stored if clean_value(item)}
+
+
+def store_seen_for_combo(state, signature, seen) -> None:
+    """Record the identities for this combo in the checkpoint."""
+    if not isinstance(state, dict):
+        return
+    state["combo_signature"] = signature
+    state["seen_job_ids"] = sorted(seen)[:MAX_TRACKED_JOB_IDS]
+
+
+def clear_seen_for_combo(state) -> None:
+    """Forget the tracked identities -- the combo is finished."""
+    if isinstance(state, dict):
+        state.pop("combo_signature", None)
+        state.pop("seen_job_ids", None)
+
+
+def report_combo_stop(reason, seen_count, pages_visited, saved_here) -> None:
+    """Say why the combo ended, and never overstate it."""
+    if reason == STOP_TARGET_REACHED:
+        log("\n     [TARGET REACHED]")
+        log("     %d unique-job target achieved." % TARGET_UNIQUE_JOBS)
+    else:
+        log("\n     [STOPPED: %s]" % reason)
+        log("     target of %d unique job(s) NOT reached."
+            % TARGET_UNIQUE_JOBS)
+    log("     unique jobs encountered : %d" % seen_count)
+    log("     listing pages visited   : %d" % pages_visited)
+    log("     rows accepted here      : %d" % saved_here)
+
+
 def run_combo(client, state, role_category, keyword, city, existing_data):
     """Crawl every capped listing page for one (keyword, city) pair."""
     state_name = city_state_name(city)
@@ -1927,19 +2081,42 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
     save_city_state(city, max(1, int(state.get("current_page", 1))))
     save_role_state(role_category, keyword)
 
-    log("\n  >> %s | %s, %s" % (keyword, city, state_name))
+    log("\n  " + "=" * 56)
+    log("  Keyword: %s" % keyword)
+    log("  City: %s, %s" % (city, state_name))
+    log("  Target unique jobs: %d" % TARGET_UNIQUE_JOBS)
+    log("  Maximum listing pages: %d" % MAX_LISTING_PAGES)
+    log("  " + "=" * 56)
 
     page_number = max(1, int(state.get("current_page", 1)))
     total = None
     saved_here = 0
-    pages_planned = None
-    # Every job key this combo has seen, across all of its pages. The site
-    # repeats cards once it runs out of real results, so "this page brought
-    # nothing new" is the end of the results -- a more honest signal than
-    # the header count, which under-reports.
-    seen_in_combo = set()
 
-    while page_number <= MAX_LISTING_PAGES:
+    # Every job identity this combo has seen, across all of its pages,
+    # RESTORED from the checkpoint when this is a resumed combo. The site
+    # repeats cards across pages, so only distinct identities are counted.
+    signature = combo_signature(keyword, city)
+    seen_in_combo = load_seen_for_combo(state, signature)
+    if seen_in_combo:
+        log("  resuming: %d unique job(s) already seen for this combo, "
+            "continuing at page %d" % (len(seen_in_combo), page_number))
+
+    pages_visited = 0
+    stop_reason = None
+
+    while True:
+        # -- the page ceiling, checked before the request is made ----------
+        if page_number > max(1, MAX_LISTING_PAGES):
+            stop_reason = STOP_MAX_PAGE_LIMIT
+            break
+
+        # -- the target, checked before the request is made ----------------
+        # Checked HERE as well as after each page so a resumed combo that is
+        # already at the target spends no request at all.
+        if len(seen_in_combo) >= TARGET_UNIQUE_JOBS:
+            stop_reason = STOP_TARGET_REACHED
+            break
+
         pacing_gate()
         wait_for_internet()
 
@@ -1947,9 +2124,21 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
         try:
             jobs, total = client.search_jobs(keyword, city, page_number)
         except IndeedAccessDenied as denied:
+            # The refusal is recorded against the exact url, keyword, city
+            # and page, marked for manual review so the replay queue does
+            # not keep asking for it, and the unique-job progress is
+            # checkpointed BEFORE the raise so a resume does not recount.
             record_failed("listing", "%s|%s|p%d" % (keyword, city, page_number),
                           "access denied: %s" % denied, status=denied.status,
                           context=context, recovery_status="manual")
+            # current_page is NOT advanced here. The AccessBlocked
+            # handler decides that: an isolated refusal resumes at the next
+            # page so the refused one is not asked for again, while a
+            # session-wide refusal keeps the page for after the cooldown.
+            store_seen_for_combo(state, signature, seen_in_combo)
+            save_crawl_cycle_state(state)
+            report_combo_stop(STOP_ACCESS_DENIED, len(seen_in_combo),
+                              pages_visited, saved_here)
             raise AccessBlocked(denied.status,
                                 "%s|%s|p%d" % (keyword, city, page_number),
                                 detail=str(denied), work_type="listing",
@@ -1959,6 +2148,8 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
                           "rate limited", status=429, context=context,
                           retry_delay_seconds=limited.retry_after
                           or DEFAULT_429_WAIT_SECONDS)
+            store_seen_for_combo(state, signature, seen_in_combo)
+            save_crawl_cycle_state(state)
             raise AccessBlocked(429,
                                 "%s|%s|p%d" % (keyword, city, page_number),
                                 wait_seconds=limited.retry_after,
@@ -1971,38 +2162,50 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
                           context=context)
             log("     ⚠️  page %d unavailable (%s) -- queued, moving on."
                 % (page_number, type(error).__name__))
+            stop_reason = STOP_PAGE_UNAVAILABLE
             break
 
-        if pages_planned is None:
-            pages_planned = client.page_count(
+        pages_visited += 1
+
+        # The reported total is ADVISORY ONLY. It is read from the results
+        # header, and when no header selector matches, the client falls back
+        # to the number of cards on the page -- so a search whose own title
+        # says "200 job vacancies" can report 16. Pagination must therefore
+        # never terminate on it; the target, an empty page, a page with
+        # nothing new, and the page ceiling are the real stop conditions.
+        if pages_visited == 1:
+            planned = client.page_count(
                 total, cap=MAX_LISTING_PAGES, minimum=MIN_LISTING_PAGES)
-            if total == 0 and jobs:
-                # The header said nothing but the page is full of cards, so
-                # the header is not to be trusted at all here. Capping at the
-                # FLOOR would miss real pages (the floor can be 1), so the
-                # ceiling applies and the early-stop rules below -- an empty
-                # page, or a page with nothing new -- decide where to stop.
-                pages_planned = max(1, MAX_LISTING_PAGES)
-                log("     header reported 0 jobs but the page has %d card(s)"
-                    " -- ignoring the header, crawling up to %d page(s) and "
-                    "stopping when a page brings nothing new"
-                    % (len(jobs), pages_planned))
-            else:
-                log("     %s job(s) reported -> %d page(s) to crawl "
-                    "(floor %d, cap %d)"
-                    % ("{:,}".format(total), pages_planned,
-                       MIN_LISTING_PAGES, MAX_LISTING_PAGES))
-            if total == 0 and not jobs:
-                break
+            log("     reported total: %s (advisory only -- %d page(s) by that "
+                "count; pagination follows the %d unique-job target)"
+                % ("{:,}".format(total) if total else "unknown",
+                   planned, TARGET_UNIQUE_JOBS))
 
-        page_keys = {str(job.get("job_key") or job.get("source_url") or "")
-                     for job in jobs}
-        page_keys.discard("")
-        new_keys = page_keys - seen_in_combo
-        seen_in_combo |= page_keys
+        # Distinct identities only: a card repeated from an earlier page is
+        # a duplicate, not a second job. A card with no usable identity is
+        # not counted at all rather than inflating the total.
+        page_ids = {job_identity(job) for job in jobs}
+        page_ids.discard("")
+        new_keys = page_ids - seen_in_combo
+        duplicates = len(page_ids) - len(new_keys)
+        unidentified = len(jobs) - len(page_ids)
+        seen_in_combo |= page_ids
 
-        log("     page %d: %d listing(s) (%d new)"
-            % (page_number, len(jobs), len(new_keys)))
+        log("\n     [PAGE %d]" % page_number)
+        log("     Cards found: %d" % len(jobs))
+        log("     New unique jobs: %d" % len(new_keys))
+        if duplicates:
+            log("     Duplicate jobs: %d" % duplicates)
+        if unidentified:
+            log("     Cards with no usable id (not counted): %d"
+                % unidentified)
+        log("     Total unique jobs: %d/%d"
+            % (len(seen_in_combo), TARGET_UNIQUE_JOBS))
+
+        # Checkpointed as soon as the page is accounted for, so a stop
+        # anywhere below resumes with the right count.
+        store_seen_for_combo(state, signature, seen_in_combo)
+        save_crawl_cycle_state(state)
 
         already_done = set(state.get("done_job_urls") or [])
 
@@ -2019,6 +2222,19 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
             if job_url and job_url in already_done:
                 log("       (already saved on this page -- skipping) %s"
                     % job_title[:60])
+                continue
+
+            # A card repeated from an EARLIER page of this same combo was
+            # already processed, and the Excel writer would reject it as a
+            # duplicate anyway -- after a full extract and a full read of
+            # the working file. Its identity is already known to be a
+            # repeat, so the work is skipped instead.
+            #
+            # Tested against new_keys, not seen_in_combo: the whole of this
+            # page was folded into seen_in_combo above, so every card on it
+            # is "seen" by now. new_keys is what this page actually added.
+            identity = job_identity(raw_job)
+            if identity and identity not in new_keys:
                 continue
 
             key = make_unique_key(role_category, job_title, city)
@@ -2114,53 +2330,71 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
                            human_duration(time.monotonic() - page_started),
                            saved_here))
 
+        # ------------------------------------------------------------------
+        # WHETHER TO ASK FOR ANOTHER PAGE
+        #
+        # Every branch here ends the combo WITHOUT a page delay -- the delay
+        # is only paid when another page is actually going to be opened.
+        # Order matters: the target is reported before "nothing new", so a
+        # page that both reaches the target and repeats cards is reported as
+        # the success it is.
+        # ------------------------------------------------------------------
         if not jobs:
-            if page_number > 1:
-                log("     empty page -- stopping pagination early.")
+            stop_reason = STOP_EMPTY_PAGE
             break
 
         # The checkpoint advances AFTER the page's work, never before it.
         page_number += 1
         state["current_page"] = page_number
         state["done_job_urls"] = []
+        store_seen_for_combo(state, signature, seen_in_combo)
         save_crawl_cycle_state(state)
         save_city_state(city, page_number)
 
-        if STOP_ON_PAGE_WITH_NO_NEW_JOBS and jobs and not new_keys:
-            log("     every job on page %d was already collected for this "
-                "city -- end of results, moving on" % (page_number - 1))
-            state["current_page"] = 1
-            state["done_job_urls"] = []
-            save_crawl_cycle_state(state)
-            return saved_here
-
-        if pages_planned is not None and page_number > pages_planned:
+        if len(seen_in_combo) >= TARGET_UNIQUE_JOBS:
+            # The page that crossed the line was processed in full, so the
+            # final count may exceed the target. That is correct: no valid
+            # job is discarded for being past it.
+            stop_reason = STOP_TARGET_REACHED
             break
 
-        # DON'T SPEND A REQUEST ON A PAGE THAT CANNOT HOLD ANYTHING NEW.
-        #
-        # The site paginates in steps of INDEED_PAGE_STEP (10) but a page
-        # DISPLAYS more than that -- 16 cards is typical. So a search the
-        # header reports as 16 results is "2 pages" by the step, while page
-        # 1 already showed all 16. The old code requested page 2 anyway,
-        # got back the same cards, and STOP_ON_PAGE_WITH_NO_NEW_JOBS then
-        # noticed. That is one wasted request per combo, and a wasted
-        # request is what triggers a refusal and the 10-minute cooldown
-        # after it.
-        #
-        # Counting what actually arrived is the honest check: once the cards
-        # in hand cover the reported total, the results are exhausted.
-        if total and len(seen_in_combo) >= int(total):
-            log("     page %d already held all %s reported result(s) -- "
-                "no page %d request needed"
-                % (page_number - 1, "{:,}".format(total), page_number))
-            state["current_page"] = 1
-            state["done_job_urls"] = []
-            save_crawl_cycle_state(state)
-            return saved_here
+        if STOP_ON_PAGE_WITH_NO_NEW_JOBS and not new_keys \
+                and pages_visited >= max(1, MIN_LISTING_PAGES):
+            stop_reason = STOP_NO_NEW_JOBS
+            break
 
+        if page_number > max(1, MAX_LISTING_PAGES):
+            stop_reason = STOP_MAX_PAGE_LIMIT
+            break
+
+        # ------------------------------------------------------------------
+        # THE LISTING-PAGE DELAY
+        #
+        # Reached only when another page IS going to be opened, so it is
+        # paid before the next request and never after a stop. Drawn fresh
+        # every time, so consecutive transitions differ.
+        # ------------------------------------------------------------------
+        page_delay = pick_delay(LISTING_PAGE_GAP_MIN_SECONDS,
+                                LISTING_PAGE_GAP_MAX_SECONDS)
+        if page_delay > 0:
+            log("\n     [PAGE DELAY]")
+            log("     Waiting: %s  (random %s-%s)"
+                % (human_duration(page_delay),
+                   human_duration(min(LISTING_PAGE_GAP_MIN_SECONDS,
+                                      LISTING_PAGE_GAP_MAX_SECONDS)),
+                   human_duration(max(LISTING_PAGE_GAP_MIN_SECONDS,
+                                      LISTING_PAGE_GAP_MAX_SECONDS))))
+            log("     Next: Page %d" % page_number)
+            sleep_responsive(page_delay)
+
+    report_combo_stop(stop_reason or STOP_MAX_PAGE_LIMIT, len(seen_in_combo),
+                      pages_visited, saved_here)
+
+    # The combo is finished: the tracked identities are no longer needed, and
+    # leaving them would make the NEXT combo resume against the wrong set.
     state["current_page"] = 1
     state["done_job_urls"] = []
+    clear_seen_for_combo(state)
     return saved_here
 
 
