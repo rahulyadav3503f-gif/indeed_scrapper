@@ -628,6 +628,74 @@ city and keyword delays.
 
 Eight tests cover the mode in `tests/test_excel_output.py`.
 
+## 6g. Signed out, as a guarantee
+
+### The setting
+
+```python
+USE_SAVED_LOGIN = False
+```
+
+Listing pages do not need a session, and attaching one is what gets the
+request refused:
+
+```
+signed in  (either of two accounts)  ->  403 on the first request
+signed out (no cookies at all)       ->  HTTP 200, 16 cards
+```
+
+With `COLLECT_JOB_DETAILS = False` as well, there is no page left in the
+run that wants a login, so `indeed_auth.json` is never read and
+`save_indeed_login.py` does not need to be run at all.
+
+### Why it needed a code change, not just a flag
+
+"Signed out" was previously only *what happened* when the auth file was
+missing -- the decision was three inline conditions in `start()`. An auth
+file left lying in the project (and the session-parking workflow creates
+`indeed_auth.json.bak.*` files full of live cookies) would silently
+re-attach a session and turn every request into a 403.
+
+The decision is now `BrowserTransport._saved_session_path()`, which returns
+the file to attach or `None`, so being signed out can be asserted directly
+rather than inferred. Three tests cover it: an existing auth file is
+ignored when login is off, the same file IS used when it is on, and a
+missing file also means signed out. A fourth asserts the two settings stay
+consistent -- listing-only mode must not ship with a login enabled.
+
+### A test that pinned a tunable (again)
+
+`test_the_saved_session_file_is_loaded_not_created` asserted
+`config.use_saved_login` was True. That is a tunable, and the moment it
+was turned off the test failed for no good reason -- the same mistake as
+the night-window and `MIN_LISTING_PAGES` tests earlier in this document.
+Its real intent was that this code only ever READS a session file the
+operator produced themselves. It now asserts that, plus that no
+`password=` style call exists anywhere in the client, plus that the
+`.bak.*` files are gitignored.
+
+### What was ruled out, and what is left
+
+Two more theories tested and eliminated:
+
+| Theory | Test | Result |
+|---|---|---|
+| Our cookie-decline click trips it | `cookie_banner_action = "ignore"`, nothing clicked | 200 then 403 -- identical |
+| We are simply going too fast | identical url, 7 minutes apart | 200 then 403 |
+
+Combined with the earlier measurements, every externally adjustable factor
+is eliminated: the query, the city, the account, the IP, the request rate,
+and our own consent click. What remains is that Chromium under Playwright
+reports `navigator.webdriver === true`, which a page reads on load.
+
+Changing that means spoofing the browser's identity, which this project
+does not do -- the banner in `find_indeed_job.py` promises no fingerprint
+spoofing, and relaunching the browser with a clean profile for each page
+would be the same evasion by another route. So the honest ceiling for
+signed-out collection is **one listing page per browser run**, around 16
+jobs, and the route to volume is a licensed feed through the `HttpTransport`
+that is already built and tested.
+
 ## 7. Two unrelated defects found while measuring
 
 **`BrowserTransport.kill()` was too broad.** The immediate-stop path (Ctrl+C)

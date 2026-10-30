@@ -1357,6 +1357,27 @@ class BrowserTransport(BaseTransport):
     def is_demonstration(self) -> bool:
         return not self.config.browser_live_ready
 
+    def _saved_session_path(self):
+        """The storage_state file to attach, or ``None`` to stay signed out.
+
+        Kept separate from start() so "signed out" can be asserted as a
+        guarantee rather than inferred from a missing file. It matters:
+        a signed-in request to the live site is refused (403) while the same
+        url signed out is served (200), so an auth file left lying in the
+        project must never quietly re-attach a session.
+        """
+        if not self.config.use_saved_login:
+            return None
+        auth_file = self.config.auth_file
+        if not auth_file:
+            return None
+        if os.path.exists(auth_file):
+            return auth_file
+        _log(self.config,
+             "   [BROWSER] no saved login at %s -- continuing signed out. "
+             "Run save_indeed_login.py to sign in once." % auth_file)
+        return None
+
     def start(self):
         """Launch Chromium.  Visible unless ``browser_headless`` is set."""
         if self.started:
@@ -1416,14 +1437,10 @@ class BrowserTransport(BaseTransport):
         # in a visible browser (save_indeed_login.py).  No credential is
         # read, typed or stored by this code.
         self.using_saved_login = False
-        auth_file = self.config.auth_file
-        if self.config.use_saved_login and auth_file and os.path.exists(auth_file):
-            context_options["storage_state"] = auth_file
+        session_file = self._saved_session_path()
+        if session_file:
+            context_options["storage_state"] = session_file
             self.using_saved_login = True
-        elif self.config.use_saved_login and auth_file:
-            _log(self.config,
-                 "   [BROWSER] no saved login at %s -- continuing signed out. "
-                 "Run save_indeed_login.py to sign in once." % auth_file)
 
         self.context = self.browser.new_context(**context_options)
         self.context.set_default_navigation_timeout(

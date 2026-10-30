@@ -259,13 +259,30 @@ class TestCollectionMode(unittest.TestCase):
         self.assertNotIn("accept-btn-handler", code)
 
     def test_the_saved_session_file_is_loaded_not_created(self):
+        """Where the session comes from, not whether one is switched on.
+
+        USE_SAVED_LOGIN is a tunable -- it ships False, because a signed-in
+        request to the live site is refused. What must hold either way is
+        that this code only ever READS a session file the operator made
+        themselves, and that the file is never committed.
+        """
         config = F.build_client_config(verbose=False)
-        self.assertTrue(config.use_saved_login)
         self.assertEqual(config.auth_file,
                          os.path.join(PROJECT_ROOT, "indeed_auth.json"))
         with open(os.path.join(PROJECT_ROOT, ".gitignore"),
                   encoding="utf-8") as handle:
-            self.assertIn("indeed_auth.json", handle.read())
+            ignored = handle.read()
+        self.assertIn("indeed_auth.json", ignored)
+        # Parking a session before signing out leaves a .bak file full of
+        # live cookies in the project root; that must not be committed either.
+        self.assertIn("_auth.json.bak.*", ignored)
+
+        # No credential is ever read, typed or stored.
+        with open(os.path.join(PROJECT_ROOT, "source_file",
+                               "indeed_client.py"), encoding="utf-8") as handle:
+            code = handle.read()
+        for forbidden in ("password", "fill_password", "type_password"):
+            self.assertNotIn(forbidden + "=", code)
 
     def test_a_missing_session_file_is_not_an_error(self):
         config = browser_config(auth_file="/nonexistent/indeed_auth.json")
@@ -1263,3 +1280,52 @@ class TestBrowserUnavailableIsReported(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestSignedOutCollection(unittest.TestCase):
+    """USE_SAVED_LOGIN = False must mean no session is attached at all.
+
+    Measured on the live site: a signed-in request is refused (403) while
+    the same url signed out is served (200). So "signed out" has to be a
+    real guarantee, not merely what happens when the auth file is missing --
+    an auth file left in the project must not quietly re-attach a session.
+    """
+
+    def auth_file(self):
+        folder = tempfile.mkdtemp(prefix="indeed-auth-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, "indeed_auth.json")
+        with open(path, "w") as handle:
+            handle.write('{"cookies": [], "origins": []}')
+        return path
+
+    def transport_with(self, auth, use_login):
+        config = F.build_client_config(verbose=False)
+        config.auth_file = auth
+        config.use_saved_login = use_login
+        return BrowserTransport(config)
+
+    def test_an_existing_auth_file_is_ignored_when_login_is_off(self):
+        auth = self.auth_file()
+        transport = self.transport_with(auth, False)
+        self.assertIsNone(transport._saved_session_path(),
+                          "a session would be attached despite "
+                          "use_saved_login=False")
+
+    def test_the_same_file_is_used_when_login_is_on(self):
+        auth = self.auth_file()
+        transport = self.transport_with(auth, True)
+        self.assertEqual(transport._saved_session_path(), auth)
+
+    def test_a_missing_file_also_means_signed_out(self):
+        transport = self.transport_with("/nonexistent/indeed_auth.json", True)
+        self.assertIsNone(transport._saved_session_path())
+
+    def test_listing_only_needs_no_login_at_all(self):
+        """The two settings are consistent: nothing in the run wants a session."""
+        if F.COLLECT_JOB_DETAILS:
+            self.skipTest("job pages are enabled, so a session may be wanted")
+        self.assertFalse(
+            F.USE_SAVED_LOGIN,
+            "listing-only opens no page that needs a login, so attaching a "
+            "session only risks the 403 that signing in causes")

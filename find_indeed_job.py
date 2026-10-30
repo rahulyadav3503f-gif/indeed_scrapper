@@ -89,7 +89,23 @@ INDEED_PAGE_STEP = 10               # the site paginates in steps of 10
 # Searching works signed out too, so a missing file is a warning, not an
 # error.
 AUTH_FILE = "indeed_auth.json"
-USE_SAVED_LOGIN = True
+
+# USE_SAVED_LOGIN = False -- the collector runs SIGNED OUT.
+#
+# This is deliberate, and it is the only setting that collects anything.
+# Measured on the live site, same url, same machine, minutes apart:
+#
+#   signed in  (either of two accounts)  ->  403 on the first request
+#   signed out (no cookies at all)       ->  HTTP 200, 16 cards
+#
+# Listing pages do not need a session, and attaching one is what gets the
+# request refused. Combined with COLLECT_JOB_DETAILS = False there is no
+# page left in the run that wants a login, so indeed_auth.json is not read
+# at all and save_indeed_login.py does not need to be run.
+#
+# Set this True again only if job pages are re-enabled against a source that
+# permits a signed-in session.
+USE_SAVED_LOGIN = False
 
 # -- Access rules the collector obeys ---------------------------------------
 # Paths the site's robots.txt disallows for a general agent.  The collector
