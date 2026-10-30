@@ -9,7 +9,18 @@ indeed_it_jobs_by_city.xlsx
 .~lock.*
 
 # The saved browser session from save_indeed_login.py -- a live login.
+# The .bak.* pattern matters too: parking a session before signing out
+# leaves a full set of live cookies in the project root, and "git add ."
+# would otherwise commit it.
 indeed_auth.json
+indeed_auth.json.bak.*
+
+# A browser session for any OTHER site does not belong in this project at
+# all.  naukri_auth.json was committed here once by accident; this keeps a
+# stray copy from being committed again.
+naukri_auth.json
+*_auth.json
+*_auth.json.bak.*
 
 # JSON checkpoints
 cycle_state.json

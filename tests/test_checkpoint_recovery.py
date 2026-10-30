@@ -32,7 +32,8 @@ class CheckpointTestCase(unittest.TestCase):
                         "JOB_GAP_MIN_SECONDS", "JOB_GAP_MAX_SECONDS",
                         "CITY_GAP_MIN_SECONDS", "CITY_GAP_MAX_SECONDS",
                         "KEYWORD_GAP_MIN_SECONDS",
-                        "KEYWORD_GAP_MAX_SECONDS", "NIGHT_PAUSE_ENABLED")}
+                        "KEYWORD_GAP_MAX_SECONDS", "NIGHT_PAUSE_ENABLED",
+                        "MAX_JOBS_PER_HOUR")}
         F.BASE_DIR = self.tmp
         F.VERBOSE = False
         F.REQUEST_GAP_SECONDS = 0
@@ -43,6 +44,8 @@ class CheckpointTestCase(unittest.TestCase):
         F.KEYWORD_GAP_MIN_SECONDS = 0
         F.KEYWORD_GAP_MAX_SECONDS = 0
         F.NIGHT_PAUSE_ENABLED = False
+        F.MAX_JOBS_PER_HOUR = 0        # no rate cap in tests
+        F._JOB_READ_TIMES.clear()
 
     def tearDown(self):
         for name, value in self._saved.items():

@@ -403,6 +403,25 @@ class TestPagePlanning(unittest.TestCase):
         self.assertEqual(client.page_count(1, minimum=7), 7)
 
 
+class TestPageSizeMatchesTheSitesStep(unittest.TestCase):
+    """Page planning must divide by the PAGINATION STEP, not the card count.
+
+    They were set to 16 and 10 while the comment claimed they were equal.
+    "start=" advances by 10, so dividing a reported total by 16 plans fewer
+    pages than the site has.
+    """
+
+    def test_the_page_size_is_the_pagination_step(self):
+        self.assertEqual(F.RESULTS_PER_PAGE, F.INDEED_PAGE_STEP)
+
+    def test_the_url_offset_uses_the_same_step(self):
+        first = F.INDEED_SEARCH_URL_TEMPLATE
+        self.assertIn("{start}", first)
+        config = F.build_client_config(verbose=False)
+        page_two = config.live_search_url("Network Engineer", "Pune", 2)
+        self.assertIn("start=%d" % F.INDEED_PAGE_STEP, page_two)
+
+
 class TestResultHeaderParsing(unittest.TestCase):
     """The result count is the biggest number in the header, not the first."""
 
@@ -432,6 +451,7 @@ class TestPaginationStops(unittest.TestCase):
                        ("BASE_DIR", "VERBOSE", "REQUEST_GAP_SECONDS",
                         "JOB_GAP_MIN_SECONDS", "JOB_GAP_MAX_SECONDS",
                         "NIGHT_PAUSE_ENABLED",
+                        "MAX_JOBS_PER_HOUR",
                         "LOG_EVERY_ROW", "SHOW_JOB_TIMER")}
         F.BASE_DIR = self.tmp
         F.VERBOSE = False
@@ -439,6 +459,8 @@ class TestPaginationStops(unittest.TestCase):
         F.JOB_GAP_MIN_SECONDS = 0
         F.JOB_GAP_MAX_SECONDS = 0
         F.NIGHT_PAUSE_ENABLED = False
+        F.MAX_JOBS_PER_HOUR = 0        # no rate cap in tests
+        F._JOB_READ_TIMES.clear()
         F.LOG_EVERY_ROW = False
         F.SHOW_JOB_TIMER = False
 
@@ -483,10 +505,19 @@ class TestPaginationStops(unittest.TestCase):
         return Pages()
 
     def test_an_under_reporting_header_no_longer_stops_at_two_pages(self):
-        """16 jobs / 10 per page used to mean two pages and a new city."""
-        saved, asked = self.crawl(self.pages_transport(5, header=16))
-        self.assertEqual(asked, [1, 2, 3, 4], "the floor must be crawled")
-        self.assertEqual(saved, 12)
+        """16 jobs / 10 per page used to mean two pages and a new city.
+
+        Derived from the configured floor and ceiling rather than pinned:
+        both are tunables, and MAX_LISTING_PAGES was lowered to 3 when the
+        hourly job cap came in.
+        """
+        real_pages = 8
+        saved, asked = self.crawl(self.pages_transport(real_pages, header=16))
+        expected = min(max(F.MIN_LISTING_PAGES, 2), F.MAX_LISTING_PAGES,
+                       real_pages)
+        self.assertEqual(asked, list(range(1, expected + 1)),
+                         "the floor/ceiling were not honoured")
+        self.assertEqual(saved, 3 * expected)
 
     def test_an_empty_page_stops_it_at_once(self):
         saved, asked = self.crawl(self.pages_transport(1, header=16))
@@ -495,7 +526,9 @@ class TestPaginationStops(unittest.TestCase):
         self.assertEqual(saved, 3)
 
     def test_a_page_that_repeats_earlier_jobs_stops_it(self):
-        """A header promising ten pages must not cost ten requests."""
+        """A header promising many pages must not cost many requests."""
+        if F.MAX_LISTING_PAGES < 3:
+            self.skipTest("needs a ceiling of at least 3 pages")
         saved, asked = self.crawl(
             self.pages_transport(10, header=500, repeat_after=2))
         self.assertEqual(asked, [1, 2, 3])
@@ -507,10 +540,17 @@ class TestPaginationStops(unittest.TestCase):
         self.assertEqual(saved, 3 * F.MAX_LISTING_PAGES)
 
     def test_cards_are_trusted_over_a_zero_header(self):
-        saved, asked = self.crawl(self.pages_transport(2, header=0))
-        self.assertGreaterEqual(len(asked), 2,
+        """A header of 0 with cards on the page is a lying header.
+
+        Capping at the FLOOR would miss real pages whenever the floor is
+        low, so the ceiling applies and the early-stop rules decide.
+        """
+        real_pages = 2
+        saved, asked = self.crawl(self.pages_transport(real_pages, header=0))
+        self.assertGreaterEqual(len(asked), min(real_pages,
+                                                F.MAX_LISTING_PAGES),
                                 "a wrong header must not skip a real page")
-        self.assertEqual(saved, 6)
+        self.assertEqual(saved, 3 * min(real_pages, F.MAX_LISTING_PAGES))
 
     def test_a_genuinely_empty_search_costs_one_request(self):
         saved, asked = self.crawl(self.pages_transport(0, header=0))

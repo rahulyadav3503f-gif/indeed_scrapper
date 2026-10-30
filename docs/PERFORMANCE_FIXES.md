@@ -365,6 +365,269 @@ escalation sequence, the skip, the reset after a success, and that a longer
 
 ---
 
+## 6d. The 403, the 401, and a real rate cap (30 October)
+
+### What the 403 actually was
+
+A signed-in session was blocked nine minutes after it was created (login
+saved 19:29, first 403 at 19:38), and it stayed blocked across three
+different mobile IPs. Verified by deleting the saved session and making one
+request:
+
+| | Signed in (blocked session) | Cookies deleted |
+|---|---|---|
+| `/jobs?q=…&start=0&sort=date` | 403 on every page | **HTTP 200**, 16 cards |
+| `/viewjob?jk=…` | worked, then 403 | **HTTP 401** |
+
+So the refusal was attached to **that logged-in session** -- not to the IP
+and not to Playwright. Changing IP could never have helped. Also checked and
+ruled out: the robots pre-check (it raises status 999, and all recorded
+entries were 403), the request path (robots permits `/jobs` with
+`&start=0`..`&start=90`), and the User-Agent (the browser sends Chromium's
+own; `HTTP_USER_AGENT` only applies to the unused JSON transport).
+
+Signed out, job **detail** pages answer 401, so listings are readable but no
+rows can be built without a session.
+
+### Defect: 401 was treated as a block
+
+`if status in (401, 403)` sent a 401 into the escalating access cooldown --
+`HTTP 401 access break 1/4 -- 1x the 10m 00s base cooldown` -- which is 40
+minutes of waiting for "please sign in".
+
+A 401 now raises `IndeedLoginRequired`, which:
+
+* costs **no cooldown** and skips that job immediately;
+* is recorded in `failed_pages.json` as needing a session;
+* after `MAX_LOGIN_REQUIRED_SKIPS = 5` consecutive ones, stops the run
+  (exit code 3) and prints `python3 save_indeed_login.py`, instead of
+  crawling all night and saving nothing;
+* resets its counter as soon as one job page reads normally.
+
+`IndeedLoginRequired` is deliberately **not** a subclass of
+`IndeedAccessDenied`, so a 401 can never be caught as a refusal again -- a
+test asserts that.
+
+### A real ceiling on the collection rate
+
+The operator asked for "no more than 3 jobs an hour". The gaps could not
+deliver that: with `JOB_GAP 20-30s` inside a city and `CITY_GAP 2000-4000s`
+between cities, a city with 30 pages collected hundreds of jobs in a burst
+and then idled for an hour. Burst-then-idle is the shape that provokes rate
+limiting, and its peak rate is nothing like three an hour.
+
+```python
+MAX_JOBS_PER_HOUR = 3        # one job every ~20 minutes, flat
+```
+
+A rolling-window gate checked **before** every job page, so the ceiling
+holds however the gaps are set. The window lives in
+`crawl_cycle_state.json`, so stopping and restarting cannot burst past it:
+after three reads the gate reports `59m 59s`, and a simulated restart still
+reports `59m 59s`.
+
+The gaps had to come **down** to match: a 67-minute city gap is longer than
+the cap's own 20-minute spacing, so it, not the cap, would have set the rate
+and the collector would have fallen short of three an hour.
+
+```python
+CITY_GAP_MIN_SECONDS = 60.0     # was 2000
+CITY_GAP_MAX_SECONDS = 180.0    # was 4000
+KEYWORD_GAP_MIN_SECONDS = 120.0 # was 3000
+KEYWORD_GAP_MAX_SECONDS = 300.0 # was 6000
+```
+
+A test asserts the gaps stay below the cap's spacing, so this cannot drift
+back. Net effect: a much lower peak rate than before, a steady 3 jobs/hour,
+which with the 23:00-05:00 night pause is **54 jobs a day**.
+
+For reference, the Naukri reference project's own gaps are 1s / 5s / 15s --
+it is not paced to three an hour; that is simply its observed throughput.
+
+17 tests cover this in `tests/test_error_handling.py`
+(`TestLoginRequiredIsNotABlock`, `TestHourlyJobCap`).
+
+### Not done, and why
+
+Masking `navigator.webdriver`, spoofing the browser fingerprint and rotating
+IPs or proxies were all declined. They are circumvention of an access
+control, the project's own banner promises none of them, and in this case
+they would not have worked either -- the block was on the session.
+
+---
+
+## 6e. The decisive signed-out test, and a stop that took five minutes
+
+### The measurement that settled the 403
+
+Two accounts had now been refused, after the IP had been changed twice.
+To find out what the refusal was actually attached to, one request was
+sent with no session at all -- the same URL, the same machine, the same
+public IP, nine minutes after the signed-in attempt:
+
+```
+11:22  signed in  (second account)  ->  403 on the FIRST listing request
+11:33  signed out (no cookies)      ->  HTTP 200, 16 cards parsed
+                                        title: "200 Cloud Administrator
+                                        Job Vacancies in Delhi | Indeed"
+```
+
+Same URL, same IP, same Chromium build, eleven minutes apart. That rules
+out the three things people usually blame:
+
+| Suspected cause | Ruled out by |
+|---|---|
+| The public IP | The same IP served HTTP 200 signed out |
+| Playwright / the browser | The same browser was served signed out |
+| One bad account | Two accounts, both refused -- the second faster |
+
+What is left is the session itself. An authenticated session running
+automated searches is refused; the same automation signed out is served
+normally. Note the direction of the second account's result: it was
+refused on its very first listing request, where the first account had
+managed about nine minutes of collection. Signing in again, with any
+account, is not a route back to collection.
+
+### Consequence for the project
+
+Signed-out collection works, and it reaches the listing pages only.
+That fills 25 of the 32 columns. The seven that need the job detail page
+are unavailable without a session, and `/viewjob` returns 401 signed out:
+
+```
+apply_url  skills_required  experience_min_years  experience_max_years
+company_website  expiry_date  application_deadline
+```
+
+No code change was made for this. Which of the two routes to take --
+listing-only collection, or a licensed data feed through the
+`HttpTransport` that is already built and tested -- is a decision about
+what is allowed to land in the production database, not a performance
+question.
+
+### Defect: a stop during a pause took up to five minutes
+
+`./indeed stop` on a running collector printed this:
+
+```
+Stopping (pid 24927) gracefully...
+Still running after 120s -- sending SIGKILL.
+```
+
+`sleep_long()` slept in 300-second steps and only checked
+`_SHUTDOWN_REQUESTED` between them. During a 10-minute access cooldown a
+stop could therefore go unnoticed for up to five minutes, and the
+launcher gave up and sent SIGKILL at 120 seconds. A SIGKILL mid-write is
+exactly the case the atomic Excel writes exist to survive, so nothing was
+lost -- but the collector was being killed rather than stopping.
+
+The loop now wakes every three seconds and keeps a deadline on the
+monotonic clock, so the pause is still exactly as long as it was, and the
+log still only reports progress every five minutes:
+
+```
+before:  stop noticed after up to 300s  ->  SIGKILL at 120s
+after :  stop noticed after 3.0s
+```
+
+Two tests cover it in `tests/test_error_handling.py`: one asserts a stop
+is seen in under 15 seconds during a 600-second pause, the other asserts
+a short pause still waits its full time.
+
+### Live sessions could be committed to git
+
+`.gitignore` covered `indeed_auth.json` but not the `indeed_auth.json.bak.*`
+files that parking a session creates, so `git add .` would have committed
+a full set of live cookies. Both patterns are now ignored, along with
+`*_auth.json` generally.
+
+## 6f. Listing-only mode: the url is copied, the page is not opened
+
+### What was asked for
+
+> just copy the url and paste it into excel field not open that job detail
+> page in the new tab
+
+That is exactly right, and it is cheap, because the job page's url is
+already on the listing card. The card carries `data-jk` (the job key) and
+the title link's href, and `BrowserTransport._read_listing_cards` already
+turns either of those into the job's canonical page url:
+
+```
+card data-jk = d71599c0a9fdd97d
+  -> source_url = https://in.indeed.com/viewjob?jk=d71599c0a9fdd97d
+```
+
+Nothing has to be fetched to record it. The old code fetched it anyway --
+one request per job -- to read the description, the skills and the apply
+button, and those requests were the ones returning 401 and 403.
+
+### The switch
+
+```python
+COLLECT_JOB_DETAILS = False            # ships off: job pages are not opened
+APPLY_URL_FALLS_BACK_TO_JOB_PAGE = True
+```
+
+`process_job()` now returns through `save_listing_only_row()` before the
+client is ever asked for a detail record. A test asserts this by handing
+`process_job` a client whose `get_job_detail` raises `AssertionError`:
+the row is still saved, so no request was made.
+
+`apply_url` would otherwise be blank. The job page is where the Apply
+button lives, so the card's url is written there too -- marked
+`_apply_url_kind = "job_page"` so the provenance is not lost. Set the flag
+`False` to leave the column genuinely empty instead.
+
+### What a card alone fills: 26 of 32 columns
+
+Measured on a real card shape:
+
+| Filled from the card | Blank |
+|---|---|
+| job_id, internal_job_id, job_title, company_name, job_description (the snippet), salary_min/max/currency, location, city, state, country, remote_type, employment_type, job_category, posted_date, apply_url, source_url, updated_at, fetched_at, is_fake, is_active, source_type, source_platform, score | skills_required, company_website, expiry_date, application_deadline |
+
+The three experience columns sit in between: a snippet that happens to say
+"3-6 years" fills them, one that says nothing leaves them blank.
+
+`source_type` is written as `job_portal_listing` rather than `job_portal`,
+so a row collected without its job page is distinguishable downstream.
+
+### A data defect this surfaced
+
+`parse_experience()` returns its SOURCE TEXT when it finds no year count.
+In the detail path that meant a whole job description could end up in a
+column named `experience_required`; from a card it meant the snippet was
+duplicated there. The listing path now blanks `experience_required` when
+no years were actually parsed -- the snippet already lives in
+`job_description`, and duplicating it under a misleading name would make
+the sheet claim something was stated when it was not.
+
+**The same fallback still applies to the detail path**, which is shared
+code and out of scope here. It is worth fixing separately.
+
+### Pacing had to become mode-aware
+
+`MAX_JOBS_PER_HOUR = 3` exists to bound REQUESTS. In listing-only mode a
+job costs no request -- all 16 cards arrived in the one listing request
+already made -- so counting cards against a request cap would idle for
+over five hours while fetching nothing. The cap and the 20-30 second
+between-jobs gap now apply only when job pages are actually opened. The
+listing requests themselves stay bounded by `REQUEST_GAP_SECONDS` and the
+city and keyword delays.
+
+### The run now says which mode it is in
+
+```
+[MODE]   LISTING ONLY -- job pages are NOT opened. The card's job page url
+         is written to apply_url and source_url. Always blank:
+         skills_required, company_website, expiry_date, application_deadline.
+         Blank unless the snippet happens to state it: experience_required,
+         experience_min_years, experience_max_years
+```
+
+Eight tests cover the mode in `tests/test_excel_output.py`.
+
 ## 7. Two unrelated defects found while measuring
 
 **`BrowserTransport.kill()` was too broad.** The immediate-stop path (Ctrl+C)

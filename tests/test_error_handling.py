@@ -14,6 +14,7 @@ if PROJECT_ROOT not in sys.path:
 import find_indeed_job as F                        # noqa: E402
 from source_file.indeed_client import (            # noqa: E402
     FixtureTransport,
+    IndeedLoginRequired,
     IndeedAccessDenied,
     IndeedClient,
     IndeedClientConfig,
@@ -50,7 +51,7 @@ class ErrorTestCase(unittest.TestCase):
                         "CITY_GAP_MIN_SECONDS", "CITY_GAP_MAX_SECONDS",
                         "KEYWORD_GAP_MIN_SECONDS",
                         "KEYWORD_GAP_MAX_SECONDS", "NIGHT_PAUSE_ENABLED",
-                        "_SHUTDOWN_REQUESTED")}
+                        "MAX_JOBS_PER_HOUR", "_SHUTDOWN_REQUESTED")}
         F.BASE_DIR = self.tmp
         F.VERBOSE = False
         F.REQUEST_GAP_SECONDS = 0
@@ -61,6 +62,10 @@ class ErrorTestCase(unittest.TestCase):
         F.KEYWORD_GAP_MIN_SECONDS = 0
         F.KEYWORD_GAP_MAX_SECONDS = 0
         F.NIGHT_PAUSE_ENABLED = False
+        # The hourly cap is real behaviour, but a test that waits an hour for
+        # the 4th job is useless. TestHourlyJobCap re-enables it explicitly.
+        F.MAX_JOBS_PER_HOUR = 0
+        F._JOB_READ_TIMES.clear()
         F._SHUTDOWN_REQUESTED = False
 
     def tearDown(self):
@@ -234,6 +239,188 @@ class TestEscalatingAccessCooldown(ErrorTestCase):
         self.assertEqual(F.MAX_BLOCK_COOLDOWNS, 4,
                          "1x, 2x, 3x, 4x then skip")
         self.assertEqual(F.ACCESS_BREAK_SECONDS, 600)
+
+
+class TestLoginRequiredIsNotABlock(ErrorTestCase):
+    """401 means "sign in". It must not spend the 403 cooldown.
+
+    Signed out, Indeed serves listing pages but answers 401 for /viewjob.
+    Both were raised as IndeedAccessDenied, so a 401 went into the
+    escalating access cooldown -- 10, 20, 30, 40 minutes of waiting for a
+    condition no wait can change.
+    """
+
+    def setUp(self):
+        super().setUp()
+        F._LOGIN_REQUIRED_SKIPS = 0
+        # This class is about what happens when a JOB PAGE is opened, so it
+        # pins the detail mode rather than inheriting whatever the shipped
+        # default happens to be (it ships listing-only, which never opens
+        # one and so can never see a 401).
+        self._saved_mode = F.COLLECT_JOB_DETAILS
+        F.COLLECT_JOB_DETAILS = True
+        self._slept = []
+        self._real_sleep = F.sleep_long
+        F.sleep_long = lambda seconds, reason: self._slept.append(int(seconds))
+
+    def tearDown(self):
+        F.COLLECT_JOB_DETAILS = self._saved_mode
+        F.sleep_long = self._real_sleep
+        F._LOGIN_REQUIRED_SKIPS = 0
+        super().tearDown()
+
+    def transport(self):
+        class ListingsOkDetails401(FixtureTransport):
+            def search(self, keyword, city, page, config):
+                jobs = [{"job_key": "k%d" % i, "title": "Network Engineer",
+                         "company_name": "Acme Ltd", "snippet": "short",
+                         "source_url": "https://in.indeed.com/viewjob?jk=k%d" % i,
+                         "detail_page_url":
+                             "https://in.indeed.com/viewjob?jk=k%d" % i}
+                        for i in range(8)]
+                return {"jobs": jobs, "total": 8}
+
+            def detail(self, job, config):
+                raise IndeedLoginRequired(
+                    "HTTP 401 for job -- this page needs a signed-in session",
+                    url=str(job.get("source_url")), status=401)
+
+        return ListingsOkDetails401()
+
+    def client(self):
+        return IndeedClient(
+            IndeedClientConfig(verbose=False, request_gap_seconds=0,
+                               min_listing_pages=1, max_listing_pages=1,
+                               results_per_page=F.RESULTS_PER_PAGE),
+            transport=self.transport())
+
+    def test_a_401_costs_no_cooldown(self):
+        state = F.load_or_open_crawl_cycle(CITIES, PAIRS)
+        try:
+            F.run_combo(self.client(), state, "IT Department",
+                        "Network Engineer", "Pune", {})
+        except F.LoginRequiredRepeatedly:
+            pass
+        self.assertEqual(self._slept, [],
+                         "a 401 must not spend the 403 cooldown")
+
+    def test_a_401_is_recorded_for_review(self):
+        state = F.load_or_open_crawl_cycle(CITIES, PAIRS)
+        try:
+            F.run_combo(self.client(), state, "IT Department",
+                        "Network Engineer", "Pune", {})
+        except F.LoginRequiredRepeatedly:
+            pass
+        queue = F.load_failed_pages()
+        self.assertTrue(queue)
+        self.assertEqual(queue[0]["http_status"], 401)
+        self.assertIn("signed-in session", queue[0]["reason"])
+
+    def test_it_gives_up_after_the_configured_number_of_skips(self):
+        """Crawling for hours and saving nothing is worse than stopping."""
+        state = F.load_or_open_crawl_cycle(CITIES, PAIRS)
+        with self.assertRaises(F.LoginRequiredRepeatedly):
+            F.run_combo(self.client(), state, "IT Department",
+                        "Network Engineer", "Pune", {})
+        self.assertEqual(F._LOGIN_REQUIRED_SKIPS, F.MAX_LOGIN_REQUIRED_SKIPS)
+
+    def test_a_403_still_escalates(self):
+        """The split must not have weakened the 403 path."""
+        client = self.client_raising(
+            IndeedAccessDenied("denied", url="u", status=403))
+        state = F.load_or_open_crawl_cycle(CITIES, PAIRS)
+        with self.assertRaises(F.AccessBlocked) as caught:
+            F.run_combo(client, state, "IT Department", "Network Engineer",
+                        "Pune", {})
+        self.assertEqual(caught.exception.status, 403)
+
+    def test_the_two_statuses_are_separate_error_types(self):
+        from source_file.indeed_client import (IndeedAccessDenied as denied,
+                                               IndeedLoginRequired as login)
+        self.assertFalse(issubclass(login, denied),
+                         "a 401 must not be catchable as an access refusal")
+
+
+class TestHourlyJobCap(ErrorTestCase):
+    """No more than MAX_JOBS_PER_HOUR job pages in any rolling hour."""
+
+    def setUp(self):
+        super().setUp()
+        F.MAX_JOBS_PER_HOUR = self._saved["MAX_JOBS_PER_HOUR"]   # the real one
+        F._JOB_READ_TIMES.clear()
+
+    def test_the_setting_exists_and_is_three(self):
+        self.assertEqual(F.MAX_JOBS_PER_HOUR, 3)
+
+    def test_the_cap_allows_exactly_that_many_then_holds(self):
+        state = {}
+        for _ in range(F.MAX_JOBS_PER_HOUR):
+            self.assertEqual(F.seconds_until_job_allowed(), 0.0)
+            F.note_job_read(state)
+        self.assertGreater(F.seconds_until_job_allowed(), 3500)
+
+    def test_the_window_rolls(self):
+        """A read 61 minutes ago no longer counts against the hour."""
+        import time as time_module
+        F._JOB_READ_TIMES.extend(time_module.time() - 3660
+                                 for _ in range(F.MAX_JOBS_PER_HOUR))
+        self.assertEqual(F.seconds_until_job_allowed(), 0.0)
+
+    def test_a_restart_cannot_burst_past_the_cap(self):
+        state = {}
+        for _ in range(F.MAX_JOBS_PER_HOUR):
+            F.note_job_read(state)
+        held = F.seconds_until_job_allowed()
+        self.assertGreater(held, 3500)
+
+        F._JOB_READ_TIMES.clear()           # as a fresh process would start
+        F.load_job_read_times(state)        # ...but the checkpoint remembers
+        self.assertGreater(F.seconds_until_job_allowed(), 3500)
+
+    def test_the_checkpoint_only_keeps_the_last_hour(self):
+        import time as time_module
+        state = {"recent_job_reads": [time_module.time() - 7200,
+                                      time_module.time() - 60]}
+        F.load_job_read_times(state)
+        self.assertEqual(len(F._JOB_READ_TIMES), 1)
+
+    def test_rubbish_in_the_checkpoint_is_ignored(self):
+        F.load_job_read_times({"recent_job_reads": ["x", None, {}]})
+        self.assertEqual(F._JOB_READ_TIMES, [])
+
+    def test_zero_disables_the_cap(self):
+        saved = F.MAX_JOBS_PER_HOUR
+        F.MAX_JOBS_PER_HOUR = 0
+        try:
+            state = {}
+            for _ in range(50):
+                F.note_job_read(state)
+            self.assertEqual(F.seconds_until_job_allowed(), 0.0)
+        finally:
+            F.MAX_JOBS_PER_HOUR = saved
+
+    def test_the_gaps_stay_below_the_caps_own_spacing(self):
+        """Otherwise the gaps, not the cap, decide the rate."""
+        cap_spacing = 3600.0 / max(1, F.MAX_JOBS_PER_HOUR)
+        for low, high, name in (
+                (F.CITY_GAP_MIN_SECONDS, F.CITY_GAP_MAX_SECONDS, "city"),
+                (F.KEYWORD_GAP_MIN_SECONDS, F.KEYWORD_GAP_MAX_SECONDS,
+                 "keyword")):
+            self.assertLess(high, cap_spacing,
+                            "the %s gap (%.0fs) exceeds the cap's spacing "
+                            "(%.0fs), so the collector cannot reach %d jobs "
+                            "an hour" % (name, high, cap_spacing,
+                                         F.MAX_JOBS_PER_HOUR))
+
+    def test_the_cap_is_enforced_before_the_request(self):
+        """It gates the job page, so the ceiling holds whatever the gaps are."""
+        with open(os.path.join(PROJECT_ROOT, "find_indeed_job.py"),
+                  encoding="utf-8") as handle:
+            source = handle.read()
+        gate = source.index("wait_for_job_quota()")
+        call = source.index("outcome = process_job(")
+        self.assertLess(gate, call,
+                        "the quota must be checked before the job is read")
 
 
 class TestCrawlDelayRanges(ErrorTestCase):
@@ -512,6 +699,39 @@ class TestNightPauseAndBreaks(ErrorTestCase):
         self.assertIsNone(F._WORK_MARK, "still paused after one resume")
         F.work_clock_resume()
         self.assertIsNotNone(F._WORK_MARK)
+
+
+class TestLongPausesAreInterruptible(ErrorTestCase):
+    """A stop during a cooldown must be noticed in seconds.
+
+    sleep_long() slept in 300-second steps and only checked the shutdown
+    flag between them, so "./indeed stop" during a 10-minute access cooldown
+    waited up to five minutes and was SIGKILLed by the launcher at 120s.
+    """
+
+    def test_a_stop_is_noticed_within_seconds(self):
+        import threading
+        import time as time_module
+
+        F.VERBOSE = False
+
+        def ask_stop():
+            time_module.sleep(1)
+            F._SHUTDOWN_REQUESTED = True
+
+        threading.Thread(target=ask_stop, daemon=True).start()
+        started = time_module.monotonic()
+        with self.assertRaises(KeyboardInterrupt):
+            F.sleep_long(600, "a ten-minute cooldown")
+        elapsed = time_module.monotonic() - started
+        self.assertLess(elapsed, 15,
+                        "a stop took %.0fs to be noticed" % elapsed)
+
+    def test_a_short_pause_still_waits_its_full_time(self):
+        import time as time_module
+        started = time_module.monotonic()
+        F.sleep_long(2, "a two-second pause")
+        self.assertGreaterEqual(time_module.monotonic() - started, 1.8)
 
 
 class TestGracefulShutdown(ErrorTestCase):

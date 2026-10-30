@@ -82,6 +82,21 @@ class IndeedAccessDenied(IndeedClientError):
         self.scope = scope
 
 
+class IndeedLoginRequired(IndeedClientError):
+    """HTTP 401 -- the page needs a signed-in session, not a cooldown.
+
+    This used to be raised as IndeedAccessDenied along with 403, which sent
+    it into the escalating access cooldown: 10, 20, 30 then 40 minutes of
+    waiting for a condition that waiting cannot change. A 401 means "sign
+    in"; the honest response is to say so and move on.
+    """
+
+    def __init__(self, message, url="", status=401):
+        super().__init__(message)
+        self.url = url
+        self.status = status
+
+
 class IndeedRateLimited(IndeedClientError):
     """HTTP 429.  Carries the server's own Retry-After when it sent one."""
 
@@ -622,7 +637,12 @@ class HttpTransport(BaseTransport):
 
             status = response.status_code
 
-            if status in (401, 403):
+            if status == 401:
+                raise IndeedLoginRequired(
+                    "HTTP 401 for %s -- this page needs a signed-in session"
+                    % label, url=url, status=status)
+
+            if status == 403:
                 # ACCESS REFUSED.  No retry, no workaround, no second route.
                 raise IndeedAccessDenied(
                     "HTTP %d for %s -- access refused by the data source"
@@ -1693,7 +1713,14 @@ class BrowserTransport(BaseTransport):
 
         status = response.status if response is not None else 200
 
-        if status in (401, 403):
+        if status == 401:
+            raise IndeedLoginRequired(
+                "HTTP 401 for %s -- this page needs a signed-in session. "
+                "Run save_indeed_login.py and sign in yourself, or collect "
+                "only what is readable signed out." % label,
+                url=url, status=status)
+
+        if status == 403:
             raise IndeedAccessDenied(
                 "HTTP %d for %s -- access refused; this is respected, not "
                 "worked around" % (status, label), url=url, status=status)

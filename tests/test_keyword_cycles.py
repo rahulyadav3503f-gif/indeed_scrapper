@@ -31,6 +31,7 @@ FAST_SETTINGS = {
     "KEYWORD_GAP_MAX_SECONDS": 0,
     "CYCLE_COOLDOWN_MINUTES": 0,
     "NIGHT_PAUSE_ENABLED": False,
+    "MAX_JOBS_PER_HOUR": 0,
     "VERBOSE": False,
 }
 
@@ -45,6 +46,7 @@ class TempProject:
         self._saved = {name: getattr(F, name) for name in FAST_SETTINGS}
         for name, value in FAST_SETTINGS.items():
             setattr(F, name, value)
+        F._JOB_READ_TIMES.clear()       # the hourly cap starts each test clean
 
     def stop(self):
         F.BASE_DIR = self._old_base

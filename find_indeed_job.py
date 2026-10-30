@@ -159,15 +159,70 @@ CYCLE_COOLDOWN_MINUTES = 45    # rest between finished crawl cycles
 #                      page costs one wasted request, not MIN of them.
 #   MAX_LISTING_PAGES  never open more than this many, however many the
 #                      header promises. This is the politeness ceiling.
-MIN_LISTING_PAGES = 4           # floor: do not believe a small header count
-MAX_LISTING_PAGES = 30          # ceiling, per (keyword, city) pair
-RESULTS_PER_PAGE = 16           # results per listing page (= INDEED_PAGE_STEP)
+# NOTE ON THESE TWO AND MAX_JOBS_PER_HOUR
+# The hourly cap gates JOB pages, and the job loop sits inside the page loop,
+# so while jobs are being read the listing requests are throttled too. The
+# exception is a page whose jobs are ALL already collected: no job is read,
+# no quota is spent, and the collector walks straight on to the next listing
+# page. With a 30-page ceiling that is up to 30 requests in a couple of
+# minutes -- the one burst the cap cannot see.
+#
+# Under a 3-jobs-an-hour cap a deep ceiling is pointless anyway: ONE listing
+# page of ~16 cards is already five hours of work. So the ceiling is low on
+# purpose; raise it only if the cap is raised with it.
+MIN_LISTING_PAGES = 1           # the header count decides, from page 1 up
+MAX_LISTING_PAGES = 3           # ceiling, per (keyword, city) pair
+# The site's PAGINATION STEP, not the number of cards you can see. "start="
+# advances by INDEED_PAGE_STEP (10), while a page displays ~16 cards, so
+# consecutive pages overlap -- which is exactly why
+# STOP_ON_PAGE_WITH_NO_NEW_JOBS exists. Page planning must use the step, or
+# it plans fewer pages than the site actually has, so this is DERIVED and
+# cannot drift out of step with it.
+RESULTS_PER_PAGE = INDEED_PAGE_STEP
 
 # Stop paginating when a page adds no job this combo has not already seen.
 # The site repeats cards across pages once it runs out of real results, so
 # "a page with nothing new on it" is the honest end-of-results signal --
 # more reliable than the header count.
 STOP_ON_PAGE_WITH_NO_NEW_JOBS = True
+
+# -- Open the job page, or just record its url? -----------------------------
+# COLLECT_JOB_DETAILS = True   the old behaviour: for every card, open the
+#                              job's own page and read the full description,
+#                              the skills, the stated experience and the
+#                              apply button's destination. One extra request
+#                              per job.
+# COLLECT_JOB_DETAILS = False  LISTING ONLY. The job page is never opened.
+#                              The card's url is written into the sheet as it
+#                              stands, and the columns that only the job page
+#                              can fill are left blank.
+#
+# Listing-only is set here because the job page returns HTTP 401 for a
+# signed-out browser and HTTP 403 for a signed-in one, so opening it
+# produced no data and one failed request per job either way. The card
+# itself still carries the title, company, location, salary, posted date and
+# the snippet -- and, most importantly, the job page's own url.
+COLLECT_JOB_DETAILS = False
+
+# In listing-only mode apply_url cannot be read (it lives on the job page
+# behind the Apply button). The job page is where a person goes to apply, so
+# its url is written into apply_url rather than leaving the column empty.
+# Set this False to leave apply_url genuinely blank instead.
+APPLY_URL_FALLS_BACK_TO_JOB_PAGE = True
+
+# Columns no card can fill. Listed here so the run can say plainly, once,
+# what will be blank -- rather than leaving it to be discovered in the sheet.
+# Columns a card cannot fill, so the run can say plainly what will be blank
+# rather than leaving it to be discovered in the sheet. The experience
+# columns are "usually blank": a snippet that happens to say "3-6 years"
+# does fill them, one that says nothing leaves them empty.
+DETAIL_ONLY_COLUMNS = (
+    "skills_required", "company_website",
+    "expiry_date", "application_deadline",
+)
+MOSTLY_BLANK_COLUMNS = (
+    "experience_required", "experience_min_years", "experience_max_years",
+)
 
 # -- Periodic breaks --------------------------------------------------------
 # After WORK_PERIOD hours of ACTUAL WORKING time (night stops, breaks,
@@ -179,7 +234,7 @@ WORK_PERIOD_MAX_HOURS = 4.2
 
 # -- Request pacing ---------------------------------------------------------
 #MIN AND MAX
-REQUEST_GAP_SECONDS = 5.0       # polite gap before each source request
+REQUEST_GAP_SECONDS = 10.0      # polite gap before each source request
 PACING_JITTER_FRACTION = 0.35   # spreads the ranks apart; not evasion
 
 # THE THREE CRAWL DELAYS ARE RANGES, NOT FIXED NUMBERS
@@ -190,12 +245,32 @@ PACING_JITTER_FRACTION = 0.35   # spreads the ranks apart; not evasion
 #
 # MIN == MAX is allowed and means a fixed delay. MIN > MAX is tolerated (they
 # are swapped), and 0 means no delay at all.
+# A HARD CEILING ON HOW MANY JOBS AN HOUR ARE COLLECTED
+# The gaps below space requests out, but they cannot bound the RATE: a city
+# with 30 pages of results collects hundreds of jobs quickly and then idles
+# through a long city gap. That burst-then-idle shape is what provokes rate
+# limiting, and it is not what "three jobs an hour" means.
+#
+# This is a rolling-window cap, checked before every job page: if the last
+# hour already holds MAX_JOBS_PER_HOUR job reads, the collector waits until
+# the oldest one falls out of the window. The count survives a restart (it
+# lives in crawl_cycle_state.json), so stopping and starting cannot be used
+# to burst past it.
+#
+#   3   -> one job roughly every 20 minutes, flat, all day
+#   0   -> no cap; only the gaps below apply
+MAX_JOBS_PER_HOUR = 3
+
 JOB_GAP_MIN_SECONDS = 20.0      # after each job detail page
 JOB_GAP_MAX_SECONDS = 30.0
-CITY_GAP_MIN_SECONDS = 2000.0     # between two cities
-CITY_GAP_MAX_SECONDS = 4000.0
-KEYWORD_GAP_MIN_SECONDS = 3000.0  # between two keywords
-KEYWORD_GAP_MAX_SECONDS = 6000.0
+# With MAX_JOBS_PER_HOUR doing the pacing, these only need to space the
+# LISTING requests out; they must stay BELOW the cap's own spacing (3/hour =
+# one job every ~20 min) or they, not the cap, become the binding constraint
+# and the collector falls short of three jobs an hour.
+CITY_GAP_MIN_SECONDS = 60.0       # between two cities
+CITY_GAP_MAX_SECONDS = 180.0
+KEYWORD_GAP_MIN_SECONDS = 120.0   # between two keywords
+KEYWORD_GAP_MAX_SECONDS = 300.0
 
 # -- HTTP timeout settings --------------------------------------------------
 HTTP_CONNECT_TIMEOUT_SECONDS = 20
@@ -226,6 +301,12 @@ RETRY_AFTER_CAP_SECONDS = 3600
 # "Consecutive" means with no successful page in between: one good page
 # resets the escalation to 1x. A Retry-After from the source is still
 # honoured when it asks for longer -- max(), never min().
+# A 401 is NOT a 403. It means "this page needs a signed-in session", and no
+# cooldown can change that, so a 401 costs no wait at all -- the job is
+# skipped and recorded. If job pages keep asking for a login, waiting hours
+# collects nothing, so the run stops after this many and says what to do.
+MAX_LOGIN_REQUIRED_SKIPS = 5
+
 ACCESS_BREAK_SECONDS = 600                  # the base 403 cooldown (1x)
 MAX_BLOCK_COOLDOWNS = 4                     # 1x..4x, then skip the unit
 UNEXPECTED_ERROR_COOLDOWN_SECONDS = 300
@@ -353,6 +434,7 @@ SHOW_JOB_TIMER = True           # time each job and the wait before the next
 from source_file.indeed_apply_url import extract_apply_url            # noqa: E402
 from source_file.indeed_client import (                                # noqa: E402
     IndeedAccessDenied,
+    IndeedLoginRequired,
     IndeedClient,
     IndeedClientConfig,
     IndeedClientError,
@@ -428,6 +510,7 @@ CRAWL_CYCLE_SCHEMA_VERSION = 1
 ROLE_CATEGORY = next(iter(job_by_department), "IT Department")
 
 _SHUTDOWN_REQUESTED = False
+_LOGIN_REQUIRED_SKIPS = 0
 _CHECKPOINT_SAVER = None
 _CLIENT_CLOSER = None       # set in main(): closes the browser gracefully
 _CLIENT_KILLER = None       # set in main(): kills the browser immediately
@@ -1000,6 +1083,15 @@ class ScheduledPause(Exception):
         self.reset_work_timer = reset_work_timer
 
 
+class LoginRequiredRepeatedly(Exception):
+    """Job pages keep asking for a session, so there is nothing to collect.
+
+    Raised instead of grinding on: signed out, Indeed serves listing pages
+    but answers 401 for /viewjob, so every job would be skipped. Stopping
+    with a clear instruction beats crawling for hours and saving nothing.
+    """
+
+
 class AccessBlocked(Exception):
     """Access was refused (403) or the quota is spent (429)."""
 
@@ -1135,6 +1227,66 @@ def pacing_gate() -> None:
             break_seconds)
 
 
+_JOB_READ_TIMES = []            # monotonic-free: wall clock, so it survives
+
+
+def load_job_read_times(state) -> None:
+    """Restore the hour's job times from the checkpoint after a restart."""
+    global _JOB_READ_TIMES
+    stored = state.get("recent_job_reads") or []
+    cutoff = time.time() - 3600
+    _JOB_READ_TIMES = sorted(float(t) for t in stored
+                             if _is_number(t) and float(t) > cutoff)
+
+
+def _is_number(value) -> bool:
+    try:
+        float(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def note_job_read(state=None) -> None:
+    """Record that a job page was read, for the hourly cap."""
+    _JOB_READ_TIMES.append(time.time())
+    _prune_job_reads()
+    if state is not None:
+        state["recent_job_reads"] = [round(t, 1) for t in _JOB_READ_TIMES]
+
+
+def _prune_job_reads() -> None:
+    cutoff = time.time() - 3600
+    while _JOB_READ_TIMES and _JOB_READ_TIMES[0] <= cutoff:
+        _JOB_READ_TIMES.pop(0)
+
+
+def seconds_until_job_allowed() -> float:
+    """How long before the hourly cap allows another job page.  0 = now."""
+    cap = int(MAX_JOBS_PER_HOUR or 0)
+    if cap <= 0:
+        return 0.0
+    _prune_job_reads()
+    if len(_JOB_READ_TIMES) < cap:
+        return 0.0
+    # The oldest read in the window has to age out before the next one.
+    return max(0.0, (_JOB_READ_TIMES[0] + 3600) - time.time())
+
+
+def wait_for_job_quota() -> None:
+    """Hold until the hourly cap allows the next job page."""
+    wait = seconds_until_job_allowed()
+    if wait <= 0:
+        return
+    log("      ⏳ hourly cap reached (%d job(s) in the last hour) -- next job "
+        "in %s" % (len(_JOB_READ_TIMES), human_duration(wait)))
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if _SHUTDOWN_REQUESTED:
+            raise KeyboardInterrupt("shutdown requested")
+        time.sleep(min(30, max(1, deadline - time.time())))
+
+
 def pick_delay(minimum, maximum) -> float:
     """A delay drawn uniformly from [minimum, maximum] seconds.
 
@@ -1194,15 +1346,25 @@ def sleep_long(seconds, reason) -> None:
 
     work_clock_pause()
     try:
-        remaining = seconds
-        while remaining > 0:
+        # The shutdown flag is checked every few seconds, not every five
+        # minutes. It used to sleep in 300-second steps, so "./indeed stop"
+        # during a 10-minute cooldown waited up to five minutes to be
+        # noticed and was SIGKILLed by the launcher at 120s instead.
+        # Progress is still only REPORTED every five minutes, so the log
+        # does not fill with noise.
+        deadline = time.monotonic() + seconds
+        next_report = time.monotonic() + 300
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
             if _SHUTDOWN_REQUESTED:
                 raise KeyboardInterrupt("shutdown requested during pause")
-            step = min(300, remaining)
-            time.sleep(step)
-            remaining -= step
-            if remaining > 0:
-                log("   still paused -- %s to go" % human_duration(remaining))
+            time.sleep(min(3.0, left))
+            if time.monotonic() >= next_report and deadline - time.monotonic() > 0:
+                log("   still paused -- %s to go"
+                    % human_duration(deadline - time.monotonic()))
+                next_report = time.monotonic() + 300
     finally:
         work_clock_resume()
     log("▶️  Resuming: %s\n" % reason)
@@ -1557,12 +1719,88 @@ def build_client(transport=None) -> IndeedClient:
         raise RuntimeError("the Indeed data source is not usable: %s" % message)
     log("  [SOURCE] %s" % client.describe())
     log("  [SOURCE] %s" % message)
+    log("  [MODE]   %s" % describe_collection_mode())
     return client
+
+
+def describe_collection_mode() -> str:
+    """One line saying which columns this run can actually fill."""
+    if COLLECT_JOB_DETAILS:
+        return ("full detail -- each job's own page is opened, all %d columns "
+                "attempted" % len(DETAIL_COLUMNS))
+    where = "apply_url and source_url" if APPLY_URL_FALLS_BACK_TO_JOB_PAGE \
+        else "source_url"
+    return ("LISTING ONLY -- job pages are NOT opened. The card's job page "
+            "url is written to %s. Always blank: %s. Blank unless the "
+            "snippet happens to state it: %s"
+            % (where, ", ".join(DETAIL_ONLY_COLUMNS),
+               ", ".join(MOSTLY_BLANK_COLUMNS)))
 
 
 # ===========================================================================
 # ONE (KEYWORD, CITY) COMBO
 # ===========================================================================
+
+def listing_only_row(raw_job, input_row):
+    """The 32 columns from ONE CARD, without opening the job page.
+
+    The card already carries the job's own page url, so nothing has to be
+    fetched to record it. ``extract_job_details`` is the same function the
+    detail path uses -- it reads the card's ``snippet`` as the description
+    and leaves what it cannot find blank -- so a listing-only row has the
+    identical shape to a detail row, just with fewer columns filled.
+    """
+    row = extract_job_details(
+        raw_job, input_row, state_resolver=city_state_name,
+        country=DEFAULT_COUNTRY, default_score=DEFAULT_JOB_SCORE,
+    )
+
+    # parse_experience() falls back to returning its SOURCE text when it
+    # finds no year count, so a card with no stated experience would copy
+    # the whole snippet into a column named experience_required. The snippet
+    # already lives in job_description; duplicating it under a misleading
+    # name would make the sheet lie about what was stated.
+    if not clean_value(row.get("experience_min_years")) \
+            and not clean_value(row.get("experience_max_years")):
+        row["experience_required"] = ""
+
+    job_page_url = clean_value(row.get("source_url"))
+    if APPLY_URL_FALLS_BACK_TO_JOB_PAGE and not clean_value(row.get("apply_url")):
+        # Not an invention: this is the page the Apply button lives on, and
+        # the url came from the card, not from guesswork.
+        row["apply_url"] = job_page_url
+        row["_apply_url_kind"] = "job_page"
+        row["_apply_url_reason"] = ("listing-only mode: the job page url from "
+                                    "the card, which is where a person "
+                                    "applies")
+
+    row["source_type"] = "job_portal_listing"
+    return row
+
+
+def save_listing_only_row(raw_job, input_row):
+    """Build and save one listing-only row.  ``"saved"``/``"skipped"``/``"failed"``."""
+    reference = str(raw_job.get("source_url")
+                    or raw_job.get("job_key")
+                    or raw_job.get("title", ""))[:200]
+    try:
+        row = listing_only_row(raw_job, input_row)
+    except Exception as error:
+        log("      ⚠️  Could not read this card (%s: %s) -- skipping."
+            % (type(error).__name__, error))
+        record_failed("listing-card", reference,
+                      "card extraction failed: %s" % error, context=input_row)
+        return "failed"
+
+    if LOG_EVERY_ROW:
+        log("      🔗 %s" % (clean_value(row.get("source_url")) or "no url"))
+
+    saved = append_detail_to_excel(row)
+    if saved is None:
+        return "skipped"
+    mark_failed_resolved(reference)
+    return "saved"
+
 
 def process_job(client, raw_job, input_row):
     """One job: detail -> 32 columns -> apply url -> validate -> save.
@@ -1570,11 +1808,40 @@ def process_job(client, raw_job, input_row):
     Returns ``"saved"``, ``"skipped"`` or ``"failed"``.  A single bad job is
     always a skip, never the end of the run.
     """
+    global _LOGIN_REQUIRED_SKIPS
+
     reference = str(raw_job.get("source_url")
                     or raw_job.get("job_key")
                     or raw_job.get("title", ""))[:200]
+
+    if not COLLECT_JOB_DETAILS:
+        # LISTING ONLY. The job page is not opened -- not in this tab, not in
+        # a new one. Its url is already on the card, so it is simply carried
+        # through to the sheet, and the card's own fields fill the rest.
+        return save_listing_only_row(raw_job, input_row)
+
     try:
         detail = client.get_job_detail(raw_job)
+    except IndeedLoginRequired as needs_login:
+        # Not a refusal: the page wants a session. No cooldown would help, so
+        # the job is skipped at once and the operator is told once.
+        _LOGIN_REQUIRED_SKIPS += 1
+        record_failed("detail", reference,
+                      "needs a signed-in session: %s" % needs_login,
+                      status=needs_login.status, context=input_row,
+                      recovery_status="manual")
+        log("      🔑 this job page needs a signed-in session (HTTP 401) -- "
+            "skipping it (%d/%d)"
+            % (_LOGIN_REQUIRED_SKIPS, MAX_LOGIN_REQUIRED_SKIPS))
+        if _LOGIN_REQUIRED_SKIPS == 1:
+            log("         Run  python3 save_indeed_login.py  and sign in "
+                "yourself to read job pages.")
+        if _LOGIN_REQUIRED_SKIPS >= MAX_LOGIN_REQUIRED_SKIPS:
+            raise LoginRequiredRepeatedly(
+                "%d job pages in a row asked for a signed-in session"
+                % _LOGIN_REQUIRED_SKIPS)
+        return "skipped"
+
     except IndeedAccessDenied as denied:
         record_failed("detail", reference, "access denied: %s" % denied,
                       status=denied.status, context=input_row,
@@ -1624,6 +1891,7 @@ def process_job(client, raw_job, input_row):
     if saved is None:
         return "skipped"
 
+    _LOGIN_REQUIRED_SKIPS = 0           # a job page read fine: session is OK
     mark_failed_resolved(reference)
     return "saved"
 
@@ -1688,13 +1956,15 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
                 total, cap=MAX_LISTING_PAGES, minimum=MIN_LISTING_PAGES)
             if total == 0 and jobs:
                 # The header said nothing but the page is full of cards, so
-                # the header is wrong, not the search. Crawl the floor and
-                # let the early-stop rule below decide where to stop.
-                pages_planned = max(1, min(MIN_LISTING_PAGES,
-                                           MAX_LISTING_PAGES))
+                # the header is not to be trusted at all here. Capping at the
+                # FLOOR would miss real pages (the floor can be 1), so the
+                # ceiling applies and the early-stop rules below -- an empty
+                # page, or a page with nothing new -- decide where to stop.
+                pages_planned = max(1, MAX_LISTING_PAGES)
                 log("     header reported 0 jobs but the page has %d card(s)"
-                    " -- crawling up to %d page(s) and stopping when a page "
-                    "brings nothing new" % (len(jobs), pages_planned))
+                    " -- ignoring the header, crawling up to %d page(s) and "
+                    "stopping when a page brings nothing new"
+                    % (len(jobs), pages_planned))
             else:
                 log("     %s job(s) reported -> %d page(s) to crawl "
                     "(floor %d, cap %d)"
@@ -1768,6 +2038,20 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
                 "source_type": "job_portal",
             }
 
+            # The hourly cap is checked HERE, before the request, so the
+            # ceiling holds however the gaps are set.
+            #
+            # It bounds REQUESTS, and in listing-only mode a job costs no
+            # request at all -- the whole page of cards arrived in the one
+            # listing request already made. Counting cards against a
+            # request cap would idle for hours while fetching nothing, so
+            # the cap applies only when job pages are actually opened. The
+            # listing requests themselves stay bounded by REQUEST_GAP_SECONDS
+            # and the city and keyword delays.
+            if COLLECT_JOB_DETAILS:
+                wait_for_job_quota()
+                note_job_read(state)
+
             job_started = time.monotonic()
             outcome = process_job(client, raw_job, input_row)
             job_seconds = time.monotonic() - job_started
@@ -1790,8 +2074,14 @@ def run_combo(client, state, role_category, keyword, city, existing_data):
 
             # Labelled, so the wait before the next job page is visible
             # rather than looking like a hang.
-            sleep_between(JOB_GAP_MIN_SECONDS, JOB_GAP_MAX_SECONDS,
-                          "next job page in" if SHOW_JOB_TIMER else "")
+            if COLLECT_JOB_DETAILS:
+                sleep_between(JOB_GAP_MIN_SECONDS, JOB_GAP_MAX_SECONDS,
+                              "next job page in" if SHOW_JOB_TIMER else "")
+            elif job_index < len(jobs):
+                # Nothing is being fetched between cards, so the long
+                # between-pages gap would only idle. A short beat keeps the
+                # log readable and the window watchable.
+                sleep_between(0.2, 0.6, "")
 
         save_master(pd.DataFrame(existing_data.values()))
 
@@ -2202,6 +2492,7 @@ def main(max_cycles=None, client=None) -> int:
                    len(state["cities"]), state["cities"][city_index],
                    page_number))
 
+        load_job_read_times(state)      # the hourly cap survives a restart
         existing_data = load_existing_master_map()
 
         try:
@@ -2220,6 +2511,29 @@ def main(max_cycles=None, client=None) -> int:
             if pause.reset_work_timer:
                 reset_work_timer()
             continue
+
+        except LoginRequiredRepeatedly as needs_login:
+            save_crawl_cycle_state(state)
+            save_master(pd.DataFrame(existing_data.values()))
+            log("\n" + "=" * 72)
+            log("STOPPING: %s." % needs_login)
+            log("")
+            log("Signed out, Indeed serves LISTING pages but answers HTTP 401")
+            log("for job pages, so every job would be skipped and nothing")
+            log("collected. This is not a block and no cooldown will fix it.")
+            log("")
+            log("  Sign in yourself:   python3 save_indeed_login.py")
+            log("")
+            log("The checkpoint is intact -- cycle %d, keyword %d/%d, "
+                "city %d/%d." % (state["crawl_cycle_number"],
+                                 state["current_keyword_index"] + 1,
+                                 len(state["keyword_order"]),
+                                 state["current_city_index"] + 1,
+                                 len(state["cities"])))
+            log("=" * 72)
+            hold_browser_on_screen(client)
+            client.cleanup()
+            return 3
 
         except AccessBlocked as blocked:
             # Decide what to step over BEFORE the break, so the resumed run

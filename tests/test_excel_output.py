@@ -252,3 +252,102 @@ class TestSafety(ExcelTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestListingOnlyMode(unittest.TestCase):
+    """COLLECT_JOB_DETAILS = False: the card's url goes in, the page is not opened.
+
+    The job page returns 401 signed out and 403 signed in, so opening it
+    yielded nothing. Listing-only carries the url straight from the card.
+    """
+
+    CARD = {
+        "job_key": "d71599c0a9fdd97d",
+        "title": "Network Engineer",
+        "company_name": "Tata Communications",
+        "formatted_location": "Pune, Maharashtra",
+        "salary_text": "600000 - 900000 a year",
+        "snippet": "Configure and maintain routers and switches.",
+        "posted_date": "3 days ago",
+        "source_url": "https://in.indeed.com/viewjob?jk=d71599c0a9fdd97d",
+        "detail_page_url": "https://in.indeed.com/viewjob?jk=d71599c0a9fdd97d",
+    }
+    INPUT = {"search_keyword": "Network Engineer", "city": "Pune",
+             "location": "Pune", "role_category": "IT Department"}
+
+    def test_the_job_page_url_is_carried_into_the_sheet(self):
+        row = F.listing_only_row(dict(self.CARD), dict(self.INPUT))
+        self.assertEqual(row["source_url"],
+                         "https://in.indeed.com/viewjob?jk=d71599c0a9fdd97d")
+
+    def test_apply_url_falls_back_to_the_job_page(self):
+        saved = F.APPLY_URL_FALLS_BACK_TO_JOB_PAGE
+        try:
+            F.APPLY_URL_FALLS_BACK_TO_JOB_PAGE = True
+            row = F.listing_only_row(dict(self.CARD), dict(self.INPUT))
+            self.assertEqual(row["apply_url"], row["source_url"])
+            F.APPLY_URL_FALLS_BACK_TO_JOB_PAGE = False
+            row = F.listing_only_row(dict(self.CARD), dict(self.INPUT))
+            self.assertEqual(row["apply_url"], "")
+        finally:
+            F.APPLY_URL_FALLS_BACK_TO_JOB_PAGE = saved
+
+    def test_the_row_is_valid_and_mostly_filled(self):
+        from source_file.indeed_extractor import DETAIL_COLUMNS, validate_row
+        row = F.listing_only_row(dict(self.CARD), dict(self.INPUT))
+        ok, why = validate_row(row)
+        self.assertTrue(ok, why)
+        filled = [c for c in DETAIL_COLUMNS
+                  if str(row.get(c, "")).strip() != ""]
+        self.assertGreaterEqual(len(filled), 24,
+                                "only %d columns filled" % len(filled))
+
+    def test_the_detail_only_columns_are_blank(self):
+        row = F.listing_only_row(dict(self.CARD), dict(self.INPUT))
+        for column in F.DETAIL_ONLY_COLUMNS:
+            self.assertEqual(str(row.get(column, "")).strip(), "",
+                             "%s should be blank from a card" % column)
+
+    def test_an_unstated_experience_is_blank_not_the_whole_snippet(self):
+        row = F.listing_only_row(dict(self.CARD), dict(self.INPUT))
+        self.assertEqual(row["experience_required"], "")
+        self.assertNotIn("routers", str(row["experience_required"]))
+
+    def test_a_snippet_that_states_years_still_fills_them(self):
+        card = dict(self.CARD, snippet="Routers. 3-6 years experience.")
+        row = F.listing_only_row(card, dict(self.INPUT))
+        self.assertEqual(row["experience_min_years"], 3)
+        self.assertEqual(row["experience_max_years"], 6)
+
+    def test_process_job_never_touches_the_client(self):
+        """The whole point: no request is made for a job page."""
+        class ExplodingClient:
+            def get_job_detail(self, job):
+                raise AssertionError("the job page must NOT be opened")
+
+        saved_mode = F.COLLECT_JOB_DETAILS
+        saved_append = F.append_detail_to_excel
+        written = []
+        try:
+            F.COLLECT_JOB_DETAILS = False
+            F.append_detail_to_excel = lambda row: written.append(row) or row
+            outcome = F.process_job(ExplodingClient(), dict(self.CARD),
+                                    dict(self.INPUT))
+        finally:
+            F.COLLECT_JOB_DETAILS = saved_mode
+            F.append_detail_to_excel = saved_append
+        self.assertEqual(outcome, "saved")
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0]["source_url"], self.CARD["source_url"])
+
+    def test_the_mode_is_described_honestly(self):
+        saved = F.COLLECT_JOB_DETAILS
+        try:
+            F.COLLECT_JOB_DETAILS = False
+            text = F.describe_collection_mode()
+            self.assertIn("LISTING ONLY", text)
+            self.assertIn("skills_required", text)
+            F.COLLECT_JOB_DETAILS = True
+            self.assertIn("full detail", F.describe_collection_mode())
+        finally:
+            F.COLLECT_JOB_DETAILS = saved
